@@ -1,0 +1,146 @@
+#!/bin/zsh
+# herdr-dispatch — 一条命令完成 herdr 派单全流程（默认派给 codex）
+#
+# 用法:
+#   herdr-dispatch -n <任务名> -f <任务书路径> [-a <codex|claude>] \
+#                  [-c <工作目录>] [-b <分支名> -r <仓库目录> [-B <基线>]] \
+#                  [-w <workspace_id>] [-t <tab_id>] [-m <模型>] [-e <思考等级>]
+#
+# 两种模式:
+#   目录模式: -c 指定工作目录，agent 起在 -w/-t 指定的 workspace（默认当前 HERDR_WORKSPACE_ID）
+#   隔离模式: -b + -r 用 git worktree add 从基线切新分支（基线默认 origin/main，-B 可覆盖），
+#             工作树放 ~/projects/worktrees/<仓库名>/<分支名>。
+#             多个 agent 动同一仓库必须用隔离模式，严禁共用一个工作目录。
+#
+# 流程: 任务书补防转包条款和交付要求 → 起 agent → 等就绪 → pane run 原子派单
+#       → 确认进入 working（通知由 herdr 原生负责）
+# 退出码: 0 派单成功且已确认 working；1 参数/环境错误；2 派单后未确认 working（需人工查看）
+
+set -u
+setopt pipefail
+
+err() { print -u2 -- "herdr-dispatch: $*"; }
+
+name="" taskfile="" agent="codex" cwd="" branch="" repo="" base="" ws="" tab="" model="" effort=""
+while (( $# )); do
+  case "$1" in
+    -n) name="$2"; shift 2 ;;
+    -f) taskfile="$2"; shift 2 ;;
+    -a) agent="$2"; shift 2 ;;
+    -c) cwd="$2"; shift 2 ;;
+    -b) branch="$2"; shift 2 ;;
+    -r) repo="$2"; shift 2 ;;
+    -B) base="$2"; shift 2 ;;
+    -w) ws="$2"; shift 2 ;;
+    -t) tab="$2"; shift 2 ;;
+    -m) model="$2"; shift 2 ;;
+    -e) effort="$2"; shift 2 ;;
+    *) err "未知参数: $1"; exit 1 ;;
+  esac
+done
+
+[[ -n "$name" && -n "$taskfile" ]] || { err "必填: -n 任务名 -f 任务书"; exit 1; }
+[[ -f "$taskfile" ]] || { err "任务书不存在: $taskfile"; exit 1; }
+taskfile="${taskfile:A}"   # 绝对路径
+
+case "$agent" in
+  # 旧版 codex 不认 --disable apps 时，删掉该参数即可
+  codex)  argv=(codex --sandbox danger-full-access --ask-for-approval never --disable apps) ;;
+  claude) argv=(claude --dangerously-skip-permissions)
+          [[ -n "$model" ]] && argv+=(--model "$model")
+          [[ -n "$effort" ]] && argv+=(--effort "$effort") ;;
+  *) err "执行者只支持 codex|claude，收到: $agent"; exit 1 ;;
+esac
+
+# 名字必须唯一，重名会让按名寻址失效
+if herdr agent get "$name" 2>/dev/null | jq -e '.result.agent' >/dev/null 2>&1; then
+  err "agent 名「$name」已存在，换个名字或先关掉旧窗格"; exit 1
+fi
+
+# 任务书补尾（幂等，靠标记行判断）
+guard="任务必须由你自己完成，严禁转派给任何其他 agent"
+if ! grep -qF "$guard" "$taskfile"; then
+  cat >> "$taskfile" <<EOF
+
+---
+## 交付要求（herdr-dispatch 自动附加）
+- 交活前自查：产出物路径在回复里写明；关键步骤贴出真实执行证据（命令+输出摘要）；不留后台残留进程。
+- 做不下去就明确说卡在哪，不要硬编。
+- ${guard}。
+EOF
+fi
+
+# 定位落点
+if [[ -n "$branch" ]]; then
+  [[ -n "$repo" && -d "$repo/.git" ]] || { err "隔离模式需要 -r 指向 git 仓库根目录"; exit 1; }
+  repo="${repo:A}"
+  base="${base:-origin/main}"
+  # 基线新鲜度：能 fetch 就 fetch，离线时明说、用本地引用继续
+  git -C "$repo" fetch origin main >/dev/null 2>&1 || err "警告: fetch origin main 失败，基线用本地现有引用"
+  git -C "$repo" rev-parse --verify --quiet "$base" >/dev/null \
+    || { err "基线不存在: $base"; exit 1; }
+  # 分支必须全新——复用旧分支等于继承未知基点，宁可报错也不静默
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" \
+    && { err "分支已存在: $branch（先删掉或换名，防止误用旧基线）"; exit 1; }
+  wtroot="$HOME/projects/worktrees/${repo:t}"
+  mkdir -p "$wtroot"
+  cwd="$wtroot/${branch//\//-}"
+  [[ -e "$cwd" ]] && { err "工作树目录已存在: $cwd（先清理）"; exit 1; }
+  wt_out=$(git -C "$repo" worktree add "$cwd" -b "$branch" "$base" 2>&1) \
+    || { err "git worktree add 失败: $wt_out"; exit 1; }
+  print -- "worktree 就绪: $cwd (分支 $branch ← 基线 $base @ $(git -C "$repo" rev-parse --short "$base"))"
+fi
+cwd="${cwd:-$PWD}"
+ws="${ws:-${HERDR_WORKSPACE_ID:-}}"
+tab="${tab:-${HERDR_TAB_ID:-}}"
+[[ -n "$ws" ]] || { err "需要 -w workspace_id（或在 herdr 内运行）"; exit 1; }
+[[ -d "$cwd" ]] || { err "工作目录不存在: $cwd"; exit 1; }
+
+# 起 agent
+start_args=(--workspace "$ws" --split right --no-focus --cwd "$cwd")
+[[ -n "$tab" ]] && start_args+=(--tab "$tab")
+out=$(herdr agent start "$name" "${start_args[@]}" -- "${argv[@]}" 2>&1) \
+  || { err "agent start 失败: $out"; exit 1; }
+
+# 等 TUI 就绪（集成 hook 会上报 idle）
+if ! herdr agent wait "$name" --status idle --timeout 90000 >/dev/null 2>&1; then
+  err "90 秒内未就绪，先看画面: herdr agent read $name"; exit 2
+fi
+
+pane=$(herdr agent get "$name" | jq -r '.result.agent.pane_id // empty')
+[[ -n "$pane" ]] || { err "拿不到 pane_id"; exit 2; }
+
+# 归位窗格布局（主格左 40% + agent 右侧网格），两种模式一致；失败不影响派单
+ltab=$(herdr pane get "$pane" 2>/dev/null | jq -r '.result.pane.tab_id // empty')
+[[ -n "$ltab" ]] && "${0:A:h}/herdr-layout" --tab "$ltab" >/dev/null 2>&1
+
+# 原子派单（文本+回车一次提交，不会卡输入框）。
+# 刚上报 idle 时 TUI 可能尚未接管输入（启动竞态、信任确认页），发送后核验，最多重试 2 次。
+st="未确认 working，请人工查看: herdr agent read $name"
+for attempt in 1 2 3; do
+  (( attempt > 1 )) && sleep 5
+  herdr pane run "$pane" "读取并执行：$taskfile" >/dev/null 2>&1 \
+    || { err "pane run 发送失败（第 $attempt 次）"; continue; }
+  if herdr agent wait "$name" --status working --timeout 20000 >/dev/null 2>&1; then
+    st="working ✓（第 $attempt 次发送）"
+    break
+  fi
+  # 没进 working 的三种情况：
+  # blocked = 停在确认页/提问页，要人工；画面有任务书路径 = 送达但没动，要人工；
+  # 都不是 = 文本被启动期吞掉（TUI 初始化清空输入框），重发。
+  # 注意送达检查不能用 wait output——它只等新出现的文本，秒送达反而误判未送达。
+  if [[ "$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status // empty')" == "blocked" ]]; then
+    st="停在确认页/提问页（blocked），请人工查看: herdr agent read $name"
+    break
+  fi
+  if herdr agent read "$name" 2>/dev/null | grep -qF "$taskfile"; then
+    st="文本已送达但未进入 working，请人工查看: herdr agent read $name"
+    break
+  fi
+  err "文本被启动期吞掉（第 $attempt 次），重发"
+done
+
+print -- "派单完成: $name → $agent @ $pane"
+print -- "状态: $st"
+print -- "监听: herdr agent wait $name --status idle --timeout <毫秒>"
+[[ "$st" == "working ✓"* ]] && exit 0 || exit 2

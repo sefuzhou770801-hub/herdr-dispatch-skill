@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+# herdr-layout — 把指定 tab 归位成「主对话格居左 + 工作 agent 右侧网格」
+#
+# 用法:
+#   herdr-layout                     # 归位当前 tab（herdr 内运行，读 HERDR_TAB_ID）
+#   herdr-layout --tab wZ:t5         # 归位指定 tab
+#   herdr-layout --main wZ:p22       # 显式指定主格（默认取 tab 里没有任务名的窗格）
+#   herdr-layout --ratio 0.4         # 主格宽度占比（默认 0.4）
+#   herdr-layout --dry-run           # 只打印计划的移动步骤，不动屏幕
+#
+# 布局规则: 主格通高居左；其余窗格在右侧排两行网格（1 个=整块，2 个=上下，
+#           3-4 个=田字格，5-6 个=2×3，按列均分）。
+#
+# 【安全红线】只用非破坏原语：pane.move（活窗格换位置，进程不动）+
+# layout.set_split_ratio（只调比例）。严禁 layout.apply——它的语义是按模板
+# 新建 tab 替换旧 tab，会连窗格带进程一起关掉（实测翻过车）。
+# 同 tab 内直接 move 无效，必须先 --new-tab 中转再搬回来。
+
+import argparse, json, os, socket, subprocess, sys, uuid
+
+SOCK = os.path.expanduser("~/.config/herdr/herdr.sock")
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.connect(SOCK)
+    req = {"id": f"hd:layout:{uuid.uuid4().hex[:8]}", "method": method, "params": params}
+    s.sendall((json.dumps(req) + "\n").encode())
+    buf = b""
+    while b"\n" not in buf:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf.decode().split("\n")[0])
+    if "error" in resp:
+        raise RuntimeError(f"{method} 失败: {resp['error']}")
+    return resp["result"]
+
+
+def cli(*args):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    out = r.stdout.strip() or r.stderr.strip()
+    try:
+        d = json.loads(out)
+    except ValueError:
+        raise RuntimeError(f"herdr {' '.join(args)} 输出不可解析: {out[:200]}")
+    if d.get("error"):
+        raise RuntimeError(f"herdr {' '.join(args)} 失败: {d['error']}")
+    return d.get("result", {})
+
+
+def leaf_panes(node, out):
+    if node["type"] == "pane":
+        out.append(node["pane_id"])
+    else:
+        leaf_panes(node["first"], out)
+        leaf_panes(node["second"], out)
+
+
+def plan_moves(main_pane, agents):
+    """生成移动步骤。列结构: [A1,A2] | [A3,A4] | ...（每列两行）"""
+    cols = [agents[i:i + 2] for i in range(0, len(agents), 2)]
+    moves = []       # (pane, split, target)
+    anchor = main_pane
+    for c in cols:
+        moves.append((c[0], "right", anchor))
+        anchor = c[0]
+    for c in cols:
+        if len(c) == 2:
+            moves.append((c[1], "down", c[0]))
+    return moves
+
+
+def grid_cols(node):
+    """网格意义上的列数：right 分割累加，leaf / down 分割算一列。"""
+    if node["type"] == "pane" or node["direction"] != "right":
+        return 1
+    return grid_cols(node["first"]) + grid_cols(node["second"])
+
+
+def fix_ratios(tab_id, main_ratio):
+    """按实际树结构调比例：根 = 主格占比；右侧 right 分割按列数均分，down 对半。"""
+    root = call("layout.export", {"tab_id": tab_id})["layout"]["root"]
+    if root["type"] != "split":
+        return
+    todo = [([], main_ratio)]
+    def walk(node, path):
+        if node["type"] != "split":
+            return
+        if path:  # 根比例已在 todo 里
+            if node["direction"] == "right":
+                todo.append((path, grid_cols(node["first"]) / grid_cols(node)))
+            else:
+                todo.append((path, 0.5))
+        walk(node["first"], path + [False])
+        walk(node["second"], path + [True])
+    walk(root["second"], [True])
+    for path, ratio in todo:
+        try:
+            call("layout.set_split_ratio", {"tab_id": tab_id, "path": path, "ratio": ratio})
+        except RuntimeError:
+            pass  # 个别比例失败不影响窗格本身
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tab", default=os.environ.get("HERDR_TAB_ID"))
+    ap.add_argument("--main", dest="main_pane")
+    ap.add_argument("--ratio", type=float, default=0.4)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    exported = call("layout.export", {"tab_id": args.tab})["layout"]
+    tab_id = exported["tab_id"]
+    ws_id = exported["workspace_id"]
+    all_panes = []
+    leaf_panes(exported["root"], all_panes)
+
+    if len(all_panes) < 2:
+        print(f"tab {tab_id} 只有 {len(all_panes)} 个窗格，无需归位")
+        return
+
+    main_pane = args.main_pane
+    if not main_pane:
+        agents_info = cli("agent", "list").get("agents", [])
+        named = {a.get("pane_id") for a in agents_info if a.get("name")}
+        # 有标签的窗格也不算主格候选（恢复现场时用 pane rename 打过任务名）
+        panes_info = cli("pane", "list", "--workspace", ws_id).get("panes", [])
+        labeled = {p.get("pane_id") for p in panes_info if p.get("label")}
+        candidates = [p for p in all_panes if p not in named and p not in labeled]
+        if not candidates:
+            sys.exit(f"tab {tab_id} 里全是有名字的 agent 窗格，用 --main 指定主格")
+        focused = exported.get("focused_pane_id")
+        main_pane = focused if focused in candidates else candidates[0]
+    if main_pane not in all_panes:
+        sys.exit(f"主格 {main_pane} 不在 tab {tab_id} 里")
+
+    agents = [p for p in all_panes if p != main_pane]
+    moves = plan_moves(main_pane, agents)
+
+    if args.dry_run:
+        print(json.dumps({"tab_id": tab_id, "main": main_pane,
+                          "中转再搬回": [f"{p} --split {d} → {t}" for p, d, t in moves]},
+                         ensure_ascii=False, indent=1))
+        return
+
+    # 1. 全部 agent 窗格搬去临时 tab（同 tab 内 move 无效，必须中转）
+    first = cli("pane", "move", agents[0], "--new-tab", "--workspace", ws_id,
+                "--label", "布局中转", "--no-focus")
+    mv = first.get("move_result", first)
+    tmp_tab = (mv.get("created_tab") or {}).get("tab_id") or \
+              (mv.get("pane") or {}).get("tab_id")
+    if not tmp_tab:
+        sys.exit(f"中转 tab 创建失败: {json.dumps(first)[:300]}")
+    for p in agents[1:]:
+        cli("pane", "move", p, "--tab", tmp_tab, "--split", "right", "--no-focus")
+
+    # 2. 按列搬回，挂到锚点上
+    for p, direction, target in moves:
+        cli("pane", "move", p, "--tab", tab_id, "--split", direction,
+            "--target-pane", target, "--no-focus")
+
+    # 3. 中转 tab 搬空后若还在，关掉（空 tab，无进程）
+    try:
+        cli("tab", "close", tmp_tab)
+    except RuntimeError:
+        pass
+
+    # 4. 调比例：根 = 主格占比，其余按网格均分
+    fix_ratios(tab_id, args.ratio)
+
+    print(f"已归位: {tab_id} 主格 {main_pane} 左 {int(args.ratio*100)}%，右侧 {len(agents)} 格网格")
+
+
+if __name__ == "__main__":
+    main()

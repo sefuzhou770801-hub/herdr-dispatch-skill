@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+# herdr-idle — 盘点（并可回收）闲置的 agent 窗格
+#
+# 用法:
+#   herdr-idle              # 列出所有闲置 agent 窗格（有任务名/标签且 agent_status=idle）
+#   herdr-idle --brief      # 一行摘要，无闲置时零输出（给 SessionStart hook 用）
+#   herdr-idle --close      # 关闭列出的全部闲置窗格
+#
+# 安全边界:
+# - 只统计有任务名（herdr agent list）或窗格标签的格——主对话格没名字，永远不入列。
+# - working / blocked 不入列（blocked 需要人工处理，不能静默关）。
+# - 单窗格工作区不入列：关掉最后一个窗格会连工作区一起回收，常驻工作区
+#   多为单格，误关等于关掉整个工作区，--include-solo 才纳入。
+
+import json, subprocess, sys
+
+
+def cli(*args):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=5)
+    try:
+        d = json.loads(r.stdout.strip() or r.stderr.strip())
+    except ValueError:
+        return {}
+    return d.get("result", {}) if not d.get("error") else {}
+
+
+def main():
+    brief = "--brief" in sys.argv
+    close = "--close" in sys.argv
+
+    named = {}
+    for a in cli("agent", "list").get("agents", []):
+        if a.get("name"):
+            named[a["pane_id"]] = a["name"]
+
+    include_solo = "--include-solo" in sys.argv
+    idle = []
+    for ws in cli("workspace", "list").get("workspaces", []):
+        ws_id = ws.get("workspace_id")
+        panes = cli("pane", "list", "--workspace", ws_id).get("panes", [])
+        if len(panes) < 2 and not include_solo:
+            continue  # 单窗格工作区：关格 = 关工作区，默认不碰
+        for p in panes:
+            pid = p.get("pane_id")
+            name = named.get(pid) or p.get("label")
+            if not name:
+                continue  # 无名格 = 主格或普通 shell，不碰
+            if p.get("agent_status") == "idle":
+                idle.append((pid, name, ws.get("label") or ws_id))
+
+    if not idle:
+        if not brief:
+            print("没有闲置的 agent 窗格")
+        return
+
+    if brief:
+        items = "、".join(f"{n}({pid})" for pid, n, _ in idle)
+        print(f"【注意】当前挂着 {len(idle)} 个闲置 agent 窗格：{items}。"
+              f"逐个 herdr agent read 验收，收完即 herdr pane close；确认还要接着用的才留。")
+        return
+
+    for pid, name, ws in idle:
+        print(f"{pid}  {name}  @ {ws}")
+    if close:
+        for pid, name, _ in idle:
+            r = subprocess.run(["herdr", "pane", "close", pid],
+                              capture_output=True, text=True, timeout=5)
+            ok = '"error"' not in (r.stdout + r.stderr)
+            print(f"{'已关闭' if ok else '关闭失败'}: {pid} {name}")
+    else:
+        print(f"\n共 {len(idle)} 个。回收: herdr-idle --close（或逐个 herdr pane close <pane_id>）")
+
+
+if __name__ == "__main__":
+    main()
