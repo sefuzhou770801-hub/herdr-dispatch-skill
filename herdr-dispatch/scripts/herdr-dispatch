@@ -354,7 +354,8 @@ print -- "$out" | grep -q 'agent_pane_busy' \
 # 中文标签写到窗格标签 + 侧栏显示名（显示用；寻址一律用 -n 的 Agent 名称）
 if [[ -n "$label" ]]; then
   herdr pane rename "$pane" "$label" >/dev/null 2>&1
-  herdr pane report-metadata "$pane" --source herdr-dispatch --agent "$agent" --display-agent "$label" >/dev/null 2>&1
+  herdr pane report-metadata "$pane" --source herdr-dispatch --agent "$agent" --display-agent "$label" \
+    --state-label working=工作中 --state-label idle=空闲 --state-label blocked=等输入 --state-label done=已完成 >/dev/null 2>&1
 fi
 # 顾问窗格：按工作区登记角色，供 herdr-guwen 定位（名字不算数，标签与登记文件算数）
 if [[ "$kind_prefix" == 顾问 ]]; then
