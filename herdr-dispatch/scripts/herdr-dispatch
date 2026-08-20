@@ -456,6 +456,11 @@ fi
 st="未确认 Agent 已进入 working 状态，请人工检查：herdr agent read $name"
 for attempt in 1 2 3 4 5; do   # 2026-08-19：由 3 次增至 5 次，给 Codex 启动期提示框留足消退时间
   (( attempt > 1 )) && sleep 5
+  # 2026-08-20 实测：Codex 新版启动会弹 hooks 信任确认框，任务文本进不去且状态看似正常。
+  # 检测到确认框先按 Esc 关闭（本轮不激活 hooks），再投递。
+  if herdr pane read "$pane" --source visible --lines 40 2>/dev/null | grep -q "hooks need review\|Press t to trust"; then
+    herdr pane send-keys "$pane" escape >/dev/null 2>&1; sleep 1
+  fi
   send_text="${q:-${start:-读取并执行：}$taskfile}"
   if [[ "$kind_prefix" == 交互 && ( "$agent" == codex || "$agent" == codex-app ) ]]; then
     send_text="身份：交互窗格。该窗格用于老板直接参与的功能讨论和原型评审。直接回答老板的问题；不分配任务、不执行验收、不写入长期记忆。讨论结论由主控复核后记录。\n\n$send_text"
