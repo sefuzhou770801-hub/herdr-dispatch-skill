@@ -179,8 +179,12 @@ case "$agent" in
           agent_kind=codex
           agent_args=(--sandbox danger-full-access --ask-for-approval never --enable apps) ;;
   grok)   agent_args=(--always-approve) ;;
+  cursor) agent_kind=cursor
+          # cursor-agent（2026-08-20 起，备用执行引擎）：--force 免审批；-m 可传 cursor 侧模型名
+          agent_args=(--force)
+          [[ -n "$model" ]] && agent_args+=(--model "$model") ;;
   claude) agent_args=(--dangerously-skip-permissions --model "${model:-claude-opus-4-8}" --effort "${effort:-max}") ;;
-  *) err "执行者只支持 codex|codex-app|grok|claude，收到：$agent"; exit 1 ;;
+  *) err "执行者只支持 codex|codex-app|grok|cursor|claude，收到：$agent"; exit 1 ;;
 esac
 # Claude 交互窗格通过原生参数追加身份说明。Codex 交互窗格在首条消息中追加同等说明。
 if [[ "$kind_prefix" == 交互 && "$agent" == claude ]]; then
@@ -196,6 +200,7 @@ if [[ -n "$resume_id" ]]; then
   case "$agent" in
     claude) agent_args+=(--resume "$resume_id") ;;
     grok)   agent_args+=(--resume "$resume_id") ;;
+    cursor) agent_args+=(--resume "$resume_id") ;;
     codex|codex-app) agent_args+=(resume "$resume_id") ;;
   esac
 fi
