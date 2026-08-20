@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""herdr-guwen — 向本工作区的项目经理顾问窗格提问，等待并读回回答。
+
+用法：
+  herdr-guwen "<问题>"                 定位顾问 → 提问 → 等待回答 → 打印回答
+  herdr-guwen -f <文件> 以文件内容为问题（长问题 / 问卷）
+  herdr-guwen --where                 只打印定位结果，不提问
+  herdr-guwen --no-wait "<问题>"       只发送，不等待
+  herdr-guwen --no-start "<问题>"      找不到顾问时不自动起，直接报错
+选项：
+  -w <workspace_id>   默认 HERDR_WORKSPACE_ID
+  -T <秒>             等待回答上限，默认 900
+  --read-only         不提问，只读回顾问最近一次回答
+
+定位规则（按角色，不按名字；2026-08-19 定案，每个工作区一个顾问）：
+  1. ~/.claude/state/herdr-advisor/<workspace_id> 登记的窗格（herdr-dispatch -k 顾问 写入）
+  2. 本工作区内 label / display_agent 含「顾问」的 agent 窗格（老板手动起的也算）
+  3. 本工作区内名字以 guwen 开头的 agent
+  都没有 → 默认在本标签页用 herdr-dispatch -k 顾问 自动起一个（--no-start 关闭）。
+读回答：Claude 顾问优先读会话记录（~/.claude/projects/<目录键>/<session>.jsonl），
+  取本次提问之后的 assistant 文本；读不到再退回 herdr agent read --source recent-unwrapped。
+退出码：0 拿到回答；1 参数/环境错误；2 顾问未找到且未起；3 等待超时或 blocked（已打印读屏）
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+STATE = HOME / ".claude" / "state"
+ADV_DIR = STATE / "herdr-advisor"
+QA_LOG = STATE / "herdr-guwen.jsonl"
+DISPATCH = HOME / ".claude" / "bin" / "herdr-dispatch"
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"herdr-guwen: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def herdr(*args, timeout=30):
+    try:
+        r = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return {}, f"{e}"
+    raw = (r.stdout or "").strip() or (r.stderr or "").strip()
+    try:
+        d = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}, raw
+    if d.get("error"):
+        return {}, json.dumps(d.get("error"), ensure_ascii=False)
+    return d.get("result", {}) or {}, ""
+
+
+def agents_in_ws(ws: str) -> list[dict]:
+    res, _ = herdr("agent", "list")
+    return [a for a in (res.get("agents") or []) if a.get("workspace_id") == ws]
+
+
+def agent_by_pane(pane: str) -> dict | None:
+    res, _ = herdr("agent", "get", pane)
+    a = res.get("agent")
+    return a if a else None
+
+
+def locate(ws: str, my_tab: str) -> tuple[dict | None, str]:
+    """返回 (agent, 命中方式)。"""
+    # 1. 角色登记文件
+    f = ADV_DIR / ws
+    if f.exists():
+        pane = f.read_text(encoding="utf-8").strip()
+        a = agent_by_pane(pane) if pane else None
+        if a and a.get("workspace_id") == ws:
+            return a, f"登记文件 {f}"
+    # 2/3. 本工作区按标签 / 显示名 / 名字
+    cands = []
+    for a in agents_in_ws(ws):
+        label = a.get("label") or ""
+        disp = a.get("display_agent") or ""
+        name = a.get("name") or ""
+        if "顾问" in label or "顾问" in disp:
+            cands.append((0, a, f"窗格标签「{label or disp}」含「顾问」"))
+        elif name.startswith("guwen"):
+            cands.append((1, a, f"agent 名 {name}"))
+    if cands:
+        # 同标签页优先，其次按命中方式
+        cands.sort(key=lambda c: (0 if c[1].get("tab_id") == my_tab else 1, c[0]))
+        _, a, how = cands[0]
+        # 顺手补登记，下次直接命中
+        try:
+            ADV_DIR.mkdir(parents=True, exist_ok=True)
+            (ADV_DIR / ws).write_text(a["pane_id"] + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        return a, how
+    return None, ""
+
+
+def start_advisor(ws: str) -> dict | None:
+    name = "guwen-" + re.sub(r"[^a-z0-9]", "", ws.lower())
+    if agent_by_pane(name):
+        name += "-2"
+    print(f"herdr-guwen: 本工作区没有顾问窗格，按手册起一个：{name}（Fable 5）", file=sys.stderr)
+    try:
+        r = subprocess.run(
+            [str(DISPATCH), "-n", name, "-k", "顾问", "-w", ws],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:
+        print(f"herdr-guwen: 起顾问失败：{e}", file=sys.stderr)
+        return None
+    if r.returncode != 0:
+        print(f"herdr-guwen: 起顾问失败：{(r.stderr or r.stdout).strip()[:400]}", file=sys.stderr)
+        return None
+    return agent_by_pane(name)
+
+
+def transcript_path(a: dict) -> Path | None:
+    sess = (a.get("agent_session") or {})
+    sid = sess.get("value") or ""
+    if a.get("agent") != "claude" or not sid:
+        return None
+    tp = sess.get("transcript") or a.get("transcript")
+    if tp and Path(tp).exists():
+        return Path(tp)
+    cwd = a.get("cwd") or ""
+    key = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    p = HOME / ".claude" / "projects" / key / f"{sid}.jsonl"
+    return p if p.exists() else None
+
+
+def answer_from_transcript(tp: Path, marker: str) -> str | None:
+    """取含 marker 的用户消息之后的全部 assistant 文本。"""
+    try:
+        lines = tp.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    seen = False
+    parts: list[str] = []
+    for ln in lines:
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        typ = d.get("type")
+        msg = d.get("message") or {}
+        content = msg.get("content")
+        if typ == "user":
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+            if marker in text:
+                seen = True
+                parts = []
+            continue
+        if seen and typ == "assistant" and isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+                    parts.append(c["text"])
+    if not seen:
+        return None
+    return "\n".join(parts).strip() or None
+
+
+def answer_from_screen(target: str, marker: str) -> str:
+    res, err = herdr("agent", "read", target, "--source", "recent-unwrapped", "--lines", "200")
+    text = ""
+    if isinstance(res, dict):
+        text = res.get("text") or res.get("output") or json.dumps(res, ensure_ascii=False)
+    if not text:
+        text = err
+    idx = text.rfind(marker)
+    return text[idx:] if idx >= 0 else text[-4000:]
+
+
+def log_qa(obj: dict) -> None:
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with QA_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    ws = os.environ.get("HERDR_WORKSPACE_ID") or ""
+    my_tab = os.environ.get("HERDR_TAB_ID") or ""
+    timeout_s = 900
+    wait = True
+    auto_start = True
+    where_only = False
+    read_only = False
+    question = ""
+    qfile = ""
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-w":
+            ws = argv[i + 1]; i += 2
+        elif a == "-T":
+            timeout_s = int(argv[i + 1]); i += 2
+        elif a == "-f":
+            qfile = argv[i + 1]; i += 2
+        elif a == "--no-wait":
+            wait = False; i += 1
+        elif a == "--no-start":
+            auto_start = False; i += 1
+        elif a == "--where":
+            where_only = True; i += 1
+        elif a == "--read-only":
+            read_only = True; i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__.strip()); return 0
+        elif a.startswith("-") and len(a) > 1:
+            die(f"未知参数：{a}")
+        else:
+            question = a; i += 1
+    if os.environ.get("HERDR_ENV") != "1":
+        die("不在 herdr 窗格内（HERDR_ENV != 1），无法定位顾问。")
+    if not ws:
+        die("缺少工作区 ID：传 -w 或在 herdr 窗格内运行。")
+    if qfile:
+        question = Path(qfile).read_text(encoding="utf-8").strip()
+    if not (where_only or read_only) and not question:
+        die("缺少问题文本。用法：herdr-guwen \"<问题>\"")
+
+    a, how = locate(ws, my_tab)
+    if not a and not where_only and not read_only and auto_start:
+        a = start_advisor(ws)
+        how = "自动起的新顾问窗格"
+    if not a:
+        print(f"herdr-guwen: 工作区 {ws} 没有顾问窗格。起一个：herdr-dispatch -n guwen-{ws.lower()} -k 顾问", file=sys.stderr)
+        return 2
+    target = a.get("name") or a["pane_id"]
+    desc = f"{a.get('label') or a.get('display_agent') or '顾问'} @ {a['pane_id']}（{a.get('agent')}，名字 {a.get('name') or '无'}，状态 {a.get('agent_status')}）"
+    if where_only:
+        print(f"顾问：{desc}\n命中：{how}")
+        return 0
+
+    marker = f"[herdr-guwen {datetime.now().strftime('%m%d-%H%M%S')}]"
+    if read_only:
+        tp = transcript_path(a)
+        print(answer_from_screen(target, "") if not tp else (tp.read_text(encoding="utf-8", errors="replace")[-6000:]))
+        return 0
+
+    # 顾问还在回答别人就先等它空下来（最多 3 分钟），避免问题排队到别人的回合后
+    if a.get("agent_status") == "working":
+        print(f"herdr-guwen: 顾问正在工作，先等待其空闲……", file=sys.stderr)
+        herdr("agent", "wait", target, "--timeout", "180000", timeout=190)
+
+    prompt = f"{marker} {question}"
+    res, err = herdr("agent", "prompt", target, prompt, "--wait", "--timeout", str(timeout_s * 1000) if wait else "5000",
+                     timeout=(timeout_s + 30) if wait else 40)
+    status = ((res.get("agent") or {}).get("agent_status")) if res else ""
+    if not res and "agent_prompt_stalled" in err:
+        # 偶发只填入输入框未提交：补一个回车再等
+        herdr("agent", "send-keys", target, "enter")
+        res, err = herdr("agent", "wait", target, "--timeout", str(timeout_s * 1000), timeout=timeout_s + 30)
+        status = ((res.get("agent") or {}).get("agent_status")) if res else ""
+    print(f"顾问：{desc}\n命中：{how}", file=sys.stderr)
+    if not wait:
+        print(f"已发送给顾问（不等待）。稍后读回：herdr-guwen --read-only", file=sys.stderr)
+        return 0
+    if not res:
+        print(f"herdr-guwen: 等待回答失败：{err[:300]}", file=sys.stderr)
+        print(answer_from_screen(target, marker))
+        return 3
+    if status == "blocked":
+        print("herdr-guwen: 顾问停在确认或提问页面（blocked），读屏如下：", file=sys.stderr)
+        print(answer_from_screen(target, marker))
+        return 3
+
+    # 读回答：会话记录优先，给文件落盘留 2 秒
+    ans = None
+    tp = transcript_path(agent_by_pane(a["pane_id"]) or a)
+    if tp:
+        for _ in range(5):
+            ans = answer_from_transcript(tp, marker)
+            if ans and ("【回答完毕】" in ans or _ >= 2):
+                break
+            time.sleep(2)
+    src = "会话记录" if ans else "读屏"
+    if not ans:
+        ans = answer_from_screen(target, marker)
+    log_qa({"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "ws": ws, "pane": a["pane_id"],
+            "question": question, "answer": ans, "source": src, "status": status})
+    print(ans)
+    print(f"\n（来源：{src}；状态 {status}；顾问 {a['pane_id']}）", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-# herdr-idle — 盘点（并可回收）闲置的 agent 窗格
+# herdr-idle — 检查并可关闭空闲的 Agent 窗格
 #
-# 用法:
-#   herdr-idle              # 列出所有闲置 agent 窗格（有任务名/标签且 agent_status=idle）
-#   herdr-idle --brief      # 一行摘要，无闲置时零输出（给 SessionStart hook 用）
-#   herdr-idle --close      # 关闭列出的全部闲置窗格
+# 用法：
+#   herdr-idle              # 列出所有空闲 Agent 窗格（有任务名称或标签，且状态为 idle 或 done）
+#   herdr-idle --brief      # 一行摘要，无空闲时零输出（给 SessionStart hook 用）
+#   herdr-idle --close      # 关闭列出的全部空闲窗格
 #
-# 安全边界:
-# - 只统计有任务名（herdr agent list）或窗格标签的格——主对话格没名字，永远不入列。
-# - working / blocked 不入列（blocked 需要人工处理，不能静默关）。
-# - 单窗格工作区不入列：关掉最后一个窗格会连工作区一起回收，常驻工作区
-#   多为单格，误关等于关掉整个工作区，--include-solo 才纳入。
+# 安全边界：
+# - 只统计有任务名称（herdr agent list）或窗格标签的窗格。主对话窗格没有名称，因此不会纳入结果。
+# - idle 与 done 一同纳入：官方 agent skill 明确二者是同一个底层状态，区别只在
+#   「这个 tab 有没有在聚焦的 herdr UI 里被看见过」——做完后但未切过去看的窗格
+#   报 done，只认 idle 会导致其无法被识别为可关闭窗格（2026-08-04 herdr 0.8.0 手册核实并修正）。
+# - working / blocked / unknown 不纳入：blocked 需要人工处理不能静默关；unknown 是
+#   herdr 无法可靠分类的状态，官方明说它不代表完成，一律不处理。
+# - 单窗格工作区不纳入结果：关闭最后一个窗格会连工作区一起回收（2026-07 教训，
+#   常驻工作区 claude学习/jowrite写作 等都是单格），--include-solo 才纳入。
+# - 表面 idle 但仍存在活动子进程的窗格不纳入（herdr-busy 判定）：herdr 的状态靠屏幕
+#   活动推断，一个正在跑测试或阻塞在 herdr wait 的窗格会被报成 idle，直接关闭会
+#   终止仍在运行的任务进程。这类窗格单独列出来提醒，不得纳入可关闭列表。
 
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 
 def cli(*args):
@@ -22,6 +29,19 @@ def cli(*args):
     except ValueError:
         return {}
     return d.get("result", {}) if not d.get("error") else {}
+
+
+def busy_panes():
+    """{pane_id: 标签}——状态显示为空闲，但进程树里仍存在受监控命令的窗格。
+    判定失败时返回空，辅助脚本失败时返回空结果，避免整个检查流程中断。"""
+    try:
+        # 同时执行 --tag：既然已经扫了一遍，把侧栏标签一并刷新（只在标签需要变化时才写），
+        # 这样即便事件钩子漏了一次，侧栏也不会持续显示过期状态
+        r = subprocess.run([os.path.expanduser("~/.claude/bin/herdr-busy"), "--json", "--tag"],
+                           capture_output=True, text=True, timeout=20)
+        return {k: v["label"] for k, v in json.loads(r.stdout or "{}").items()}
+    except Exception:
+        return {}
 
 
 def main():
@@ -34,41 +54,58 @@ def main():
             named[a["pane_id"]] = a["name"]
 
     include_solo = "--include-solo" in sys.argv
-    idle = []
+    busy = busy_panes()
+    idle, faux = [], []
     for ws in cli("workspace", "list").get("workspaces", []):
         ws_id = ws.get("workspace_id")
         panes = cli("pane", "list", "--workspace", ws_id).get("panes", [])
         if len(panes) < 2 and not include_solo:
-            continue  # 单窗格工作区：关格 = 关工作区，默认不碰
+            continue  # 单窗格工作区：关格 = 关工作区，默认不处理
         for p in panes:
             pid = p.get("pane_id")
             name = named.get(pid) or p.get("label")
             if not name:
-                continue  # 无名格 = 主格或普通 shell，不碰
-            if p.get("agent_status") == "idle":
+                continue  # 无名称窗格 = 主对话窗格或普通 shell，不处理
+            if p.get("agent_status") in ("idle", "done"):
+                if pid in busy:
+                    faux.append((pid, name, busy[pid]))  # 仍在执行，不得纳入可关闭列表
+                    continue
                 idle.append((pid, name, ws.get("label") or ws_id))
 
     if not idle:
-        if not brief:
-            print("没有闲置的 agent 窗格")
+        if brief:
+            if faux:
+                items = "、".join(f"{n}({pid}, {lab})" for pid, n, lab in faux)
+                print(f"【空闲窗格检查】{len(faux)} 个窗格的状态显示为 idle，但仍存在受监控的活动命令：{items}。"
+                      f"暂不验收或关闭，待活动命令结束后再处理。")
+        else:
+            print("没有空闲的 Agent 窗格。")
+            for pid, n, lab in faux:
+                print(f"（{pid} {n} 状态显示为 idle，当前活动为 {lab}，未列为空闲窗格。）")
         return
 
     if brief:
         items = "、".join(f"{n}({pid})" for pid, n, _ in idle)
-        print(f"【注意】当前挂着 {len(idle)} 个闲置 agent 窗格：{items}。"
-              f"逐个 herdr agent read 验收，收完即 herdr pane close；确认还要接着用的才留。")
+        msg = (f"【空闲窗格检查】当前有 {len(idle)} 个空闲的 Agent 窗格：{items}。"
+               f"请逐个运行 herdr agent read 读取输出并完成验收；验收完成后运行 herdr pane close 关闭窗格，仅保留仍需继续使用的窗格。")
+        if faux:
+            f_items = "、".join(f"{n}({pid}, {lab})" for pid, n, lab in faux)
+            msg += f" 另有 {len(faux)} 个窗格的状态显示为 idle，但仍存在受监控的活动命令：{f_items}。暂不处理。"
+        print(msg)
         return
 
     for pid, name, ws in idle:
         print(f"{pid}  {name}  @ {ws}")
+    for pid, name, lab in faux:
+        print(f"{pid}  {name}  — 状态显示为 idle，但当前活动为 {lab}，因此未列为空闲窗格。")
     if close:
         for pid, name, _ in idle:
             r = subprocess.run(["herdr", "pane", "close", pid],
                               capture_output=True, text=True, timeout=5)
             ok = '"error"' not in (r.stdout + r.stderr)
-            print(f"{'已关闭' if ok else '关闭失败'}: {pid} {name}")
+            print(f"{'已关闭' if ok else '关闭失败'}：{pid} {name}")
     else:
-        print(f"\n共 {len(idle)} 个。回收: herdr-idle --close（或逐个 herdr pane close <pane_id>）")
+        print(f"\n共 {len(idle)} 个。关闭全部空闲窗格：herdr-idle --close（或逐个 herdr pane close <pane_id>）")
 
 
 if __name__ == "__main__":

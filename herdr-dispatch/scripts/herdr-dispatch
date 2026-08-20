@@ -1,30 +1,83 @@
 #!/bin/zsh
-# herdr-dispatch — 一条命令完成 herdr 派单全流程（默认派给 codex）
+# herdr-dispatch — 通过一条命令完成 herdr 任务分配流程（herdr ≥ 0.7.5）
 #
-# 用法:
-#   herdr-dispatch -n <任务名> -f <任务书路径> [-a <codex|claude>] \
-#                  [-c <工作目录>] [-b <分支名> -r <仓库目录> [-B <基线>]] \
-#                  [-w <workspace_id>] [-t <tab_id>] [-m <模型>] [-e <思考等级>]
+# 用法：
+#   herdr-dispatch -n <拼音短名> -f <任务书路径> -a <codex|codex-app|grok|claude> \
+#                  [-l <中文标签>] [-c <工作目录>] [-b <分支名> -r <仓库目录> [-B <基线>]] \
+#                  [-k <开发|审查|交互|顾问>] [-g <区名>] \
+#                  [-w <workspace_id>] [-t <tab_id>] [-m <模型>] [-e <思考等级>] \
+#                  [-s <首条消息前缀>] [-R <session_id>] [-i <Issue 编号或 URL>]
 #
-# 两种模式:
-#   目录模式: -c 指定工作目录，agent 起在 -w/-t 指定的 workspace（默认当前 HERDR_WORKSPACE_ID）
-#   隔离模式: -b + -r 用 git worktree add 从基线切新分支（基线默认 origin/main，-B 可覆盖），
-#             工作树放 ~/projects/worktrees/<仓库名>/<分支名>。
-#             多个 agent 动同一仓库必须用隔离模式，严禁共用一个工作目录。
+# 标签页选择规则（2026-08-06 起，默认行为）：工作窗格不再默认创建在主 Agent 所在标签页中。
+#   -k 决定进哪类区：开发（默认）| 审查 | 交互。同时接受 施工 / build / review / interactive 别名。
+#   -g 设置标签页名称，用于说明其任务。标签页写成「开发·<区名>」。省略时取 -l 的
+#      中文标签（再省略取 -n），所以必须提供清晰的中文标签，避免标签页仅显示内部代号。
+#      审查区不带 -g 时就叫「审查」，是个公共区；给了 -g 就是「审查·<区名>」。
+#      交互区区名规则与开发区相同（缺省顺次取 -l、-n），但标签页直接用区名本身，
+#      不加「交互·」前缀（2026-08-07：不要公式化名字）。达到窗格数量上限后仍「<区名> 2」。
+#      交互窗格会经 herdr-log 写入本地会话日志（不修改开发和审查流程）。
+#   同名区满 4 格自动创建下一个标签页（「开发·发布冲刺 2」）。上限改 HERDR_DISPATCH_MAX_PANES。
+#   显式 -t 是例外参数：指定标签页时按照原有行为直接切分该标签页，不分区、不看上限。
+#   -R <session_id>：恢复模式，用各家 CLI 的 resume 参数在原窗格恢复会话；不需要 -f/-q/-i。
+#   -k 顾问（2026-08-19 起）：在主 Agent 所在标签页右侧起本工作区的项目经理顾问窗格（每个工作区一个）。
+#      默认 -a claude、模型 claude-fable-5、标签「技术顾问」，不需要 -f/-q/-i，不登记状态通知，
+#      窗格 ID 登记到 ~/.claude/state/herdr-advisor/<workspace_id>，供 herdr-guwen 按角色定位。
+#      名字建议 guwen-<workspace_id 小写>，例如 -n guwen-w24。
 #
-# 流程: 任务书补防转包条款和交付要求 → 起 agent → 等就绪 → pane run 原子派单
-#       → 确认进入 working（通知由 herdr 原生负责）
-# 退出码: 0 派单成功且已确认 working；1 参数/环境错误；2 派单后未确认 working（需人工查看）
+# 完工感知（2026-08-19 定案）：脚本不往任何对话推送通知。派单成功后脚本打印一条监听命令
+#   `herdr-dispatch-watch wait <名>`，主 Agent 以后台 shell 运行它，shell 退出即完工信号。
+#   register 仍记录派单者窗格（HERDR_PANE_ID）供留档与 status 查看。
+#
+# 首条消息前缀 -s（2026-08-04 起）：分配任务时发送的首条消息 = <首条消息前缀><任务书绝对路径>。
+#   不传时用默认前缀「读取并执行：」，即原有行为。
+#   走 grok 斜杠命令时把整句写进 -s，末尾留好分隔符，例如：
+#     -s "/goal 完成以下任务书的全部要求，验收标准以任务书【验收】一节为准："
+#
+# 按 GitHub Issue 分配任务 -i（2026-08-14 起，与 -f/-q 互斥）：构造 /implement #<Issue 编号> 直接发送给 Grok。
+#   herdr-dispatch -n <名> -l <标签> -a grok -c <工作目录> -i 123
+#   herdr-dispatch -n <名> -l <标签> -a grok -c <工作目录> -i https://github.com/owner/repo/issues/123
+#   Grok 的 implement 技能会自己读取 Issue 内容并执行。
+#
+# 直接发送文字 -q（2026-08-04 起，与 -f/-i 互斥）：不用任务书，把整句原样发过去。
+#   为 /deep-research 这类「参数就是问题本身、不接受文件路径参数」的斜杠命令而设：
+#     herdr-dispatch -n <名> -l <标签> -a grok -c <目录> \
+#       -q "/deep-research 比较 A 与 B 在 X 场景下的取舍，各给出可核验的来源"
+#   用 -q 时没有任务书可追加内容，交付条款不会自动追加——要求写进 -q 的正文里。
+#
+# 不同任务类型对应的命令见 ~/.claude/refs/主控手册.md。
+#
+# 命名（0.7.5 起）：Agent 名称只允许小写字母开头、小写字母/数字/-/_、1-32 字符，中文名被服务端拒收。
+#   -n 用小写拼音或英文短名（寻址用）；-l 可选中文标签，写到窗格标签上（显示用）。
+#
+# 模型：claude 默认锁定 claude-opus-4-8（防止本机默认模型变化导致实际模型改变），-m 可覆盖
+# 思考等级：claude 默认 max，-e 可覆盖（low|medium|high|xhigh|max）
+#
+# 两种模式：
+#   目录模式：-c 指定工作目录，Agent 起在 -w/-t 指定的 workspace（默认当前 HERDR_WORKSPACE_ID）
+#   隔离模式：-b + -r 走原生 `herdr worktree create --base`（基线默认 origin/main，-B 可覆盖），
+#             每个任务使用独立的 worktree 工作区（侧栏按分支可见），Agent 起在其 root pane，
+#             不进分区判定；验收后 `herdr worktree remove --workspace <id> --force` 同时删除工作树和工作区。
+#             （2026-07-11 曾因旧版不支持 --base 弃用原生命令改自拼 git worktree；0.8.0 已修，
+#              2026-08-11 恢复使用原生命令，独立 workspace 模型一并采用。）
+#
+# 流程：追加禁止转交任务的条款 → pane split 创建窗格 → agent start 启动 Agent（自带就绪等待）
+#       → agent prompt 一次性提交任务（--wait 确认进入 working，stalled 自动重试）
+#       → 开发或审查窗格登记 herdr-dispatch-watch（未检测到受监控活动命令后，向主 Agent 发送状态通知；HERDR_DISPATCH_NO_WATCH=1 关闭）
+# 0.7.5 变更（2026-07-23 适配）：agent start 不再自己创建窗格，改为在既有窗格启动 Agent 并内置就绪等待；
+#   wait 的 --status 改为 --until；原 pane run+空回车+轮询的任务提交补偿逻辑整体换成 agent prompt。
+# 退出码：0 任务已分配且已确认 working；1 参数或环境错误；2 分配后未确认 working（需人工查看）
 
 set -u
 setopt pipefail
 
 err() { print -u2 -- "herdr-dispatch: $*"; }
 
-name="" taskfile="" agent="codex" cwd="" branch="" repo="" base="" ws="" tab="" model="" effort=""
+name="" label="" taskfile="" agent="" cwd="" branch="" repo="" base="" ws="" tab="" model="" effort="" start="" q=""
+kind="" area="" resume_id="" issue=""
 while (( $# )); do
   case "$1" in
     -n) name="$2"; shift 2 ;;
+    -l) label="$2"; shift 2 ;;
     -f) taskfile="$2"; shift 2 ;;
     -a) agent="$2"; shift 2 ;;
     -c) cwd="$2"; shift 2 ;;
@@ -35,112 +88,418 @@ while (( $# )); do
     -t) tab="$2"; shift 2 ;;
     -m) model="$2"; shift 2 ;;
     -e) effort="$2"; shift 2 ;;
-    *) err "未知参数: $1"; exit 1 ;;
+    -s) start="$2"; shift 2 ;;
+    -q) q="$2"; shift 2 ;;
+    -k) kind="$2"; shift 2 ;;
+    -g) area="$2"; shift 2 ;;
+    -R) resume_id="$2"; shift 2 ;;
+    -i) [[ $# -ge 2 ]] || { err "-i 缺少 Issue 编号或 URL"; exit 1; }
+        issue="$2"; shift 2 ;;
+    *) err "未知参数：$1"; exit 1 ;;
   esac
 done
 
-[[ -n "$name" && -n "$taskfile" ]] || { err "必填: -n 任务名 -f 任务书"; exit 1; }
-[[ -f "$taskfile" ]] || { err "任务书不存在: $taskfile"; exit 1; }
-taskfile="${taskfile:A}"   # 绝对路径
-
-case "$agent" in
-  # 旧版 codex 不认 --disable apps 时，删掉该参数即可
-  codex)  argv=(codex --sandbox danger-full-access --ask-for-approval never --disable apps) ;;
-  claude) argv=(claude --dangerously-skip-permissions)
-          [[ -n "$model" ]] && argv+=(--model "$model")
-          [[ -n "$effort" ]] && argv+=(--effort "$effort") ;;
-  *) err "执行者只支持 codex|claude，收到: $agent"; exit 1 ;;
+# 分区归一化：开发（默认）| 审查 | 交互。兼容期继续接受 施工 / build / shigong。
+case "${kind:-开发}" in
+  开发|施工|build|shigong) kind_prefix="开发" ;;
+  审查|review|shencha) kind_prefix="审查" ;;
+  交互|interactive|jiaohu) kind_prefix="交互" ;;
+  顾问|advisor|guwen) kind_prefix="顾问" ;;
+  *) err "-k 只支持 开发、审查、交互、顾问（同时接受别名 施工、build、review、interactive、advisor），收到：$kind"; exit 1 ;;
 esac
+# 区名：开发区 / 交互区必须说清在干什么，缺省顺次取 -l 标签、-n 名字；
+# 审查区不给 -g 就是公共区「审查」，不强制加入任务名称。
+if [[ "$kind_prefix" == 开发 || "$kind_prefix" == 交互 ]]; then
+  area="${area:-${label:-$name}}"
+fi
+# 开发/审查：标签页「开发·<区名>」「审查·<区名>」；交互：直接用区名，不加前缀。
+if [[ "$kind_prefix" == 交互 ]]; then
+  tab_label="${area:-$name}"
+else
+  tab_label="$kind_prefix"
+  [[ -n "$area" ]] && tab_label="$kind_prefix·$area"
+fi
+# 兼容旧标签页「施工·<区名>」，避免已有分区被当成新标签页。
+legacy_tab_label=""
+if [[ "$kind_prefix" == 开发 ]]; then
+  legacy_tab_label="施工"
+  [[ -n "$area" ]] && legacy_tab_label="施工·$area"
+fi
+maxpanes="${HERDR_DISPATCH_MAX_PANES:-4}"
 
-# 名字必须唯一，重名会让按名寻址失效
-if herdr agent get "$name" 2>/dev/null | jq -e '.result.agent' >/dev/null 2>&1; then
-  err "agent 名「$name」已存在，换个名字或先关掉旧窗格"; exit 1
+if [[ "$kind_prefix" == 顾问 ]]; then
+  agent="${agent:-claude}"
+  model="${model:-claude-fable-5}"
+  label="${label:-技术顾问}"
+  tab="${tab:-${HERDR_TAB_ID:-}}"
+  [[ -n "$tab" ]] || { err "-k 顾问 需要在主 Agent 窗格内运行（缺少 HERDR_TAB_ID），或显式传 -t 标签页。"; exit 1; }
+  [[ "$agent" == claude ]] || err "警告：顾问窗格按手册应使用 Claude（Fable 5），当前 -a $agent。"
+fi
+[[ -n "$name" && -n "$agent" ]] || { err "缺少必填参数：-n Agent 名称；-a Agent 类型。"; exit 1; }
+# -f / -q / -i 三者互斥
+src_count=0
+[[ -n "$taskfile" ]] && (( src_count++ ))
+[[ -n "$q" ]] && (( src_count++ ))
+[[ -n "$issue" ]] && (( src_count++ ))
+(( src_count <= 1 )) || { err "-f、-q 和 -i 互斥，只能指定其中一个。"; exit 1; }
+# 恢复模式（-R）与顾问窗格（-k 顾问）不需要首条消息；普通模式仍要求 -f 或 -q 或 -i
+if [[ -z "$resume_id" && "$kind_prefix" != 顾问 ]]; then
+  (( src_count >= 1 )) || { err "必须指定以下参数之一：-f 任务书、-q 直接发送的文字、-i Issue 编号。"; exit 1; }
+fi
+# -i：按 Issue 分配任务，按窗格类型构造技能命令直接发送
+if [[ -n "$issue" ]]; then
+  issue_num=""
+  if [[ "$issue" =~ '^https://github.com/[^/]+/[^/]+/issues/([1-9][0-9]*)(/)?([?#].*)?$' ]]; then
+    issue_num="${match[1]}"
+  elif [[ "$issue" =~ '^[1-9][0-9]*$' ]]; then
+    issue_num="$issue"
+  else
+    err "-i 只接受 Issue 编号（如 123）或完整 URL"; exit 1
+  fi
+  case "$kind_prefix" in
+    审查) q="/code-review #${issue_num}" ;;
+    *)    q="/implement #${issue_num}" ;;
+  esac
+  print -- "按 Issue 分配任务：$q"
+fi
+[[ "$name" =~ '^[a-z][a-z0-9_-]{0,31}$' ]] \
+  || { err "0.7.5 起 Agent 名称只允许小写拼音或英文（字母开头，可含数字 - _，不超过 32 个字符），收到：「$name」；中文名称请通过 -l 设置。"; exit 1; }
+if [[ -n "$taskfile" ]]; then
+  [[ -f "$taskfile" ]] || { err "任务书不存在：$taskfile"; exit 1; }
+  taskfile="${taskfile:A}"   # 绝对路径
 fi
 
-# 任务书补尾（幂等，靠标记行判断）
-guard="任务必须由你自己完成，严禁转派给任何其他 agent"
-if ! grep -qF "$guard" "$taskfile"; then
+# 0.7.5：agent start 用 --kind 指定可执行程序，-- 后只放原生参数
+# codex-app（2026-08-07）：同一个 codex CLI，打开桌面 App 插件能力（chrome / computer-use /
+#   browser，由 ChatGPT.app 提供服务）——浏览器控制或计算机操作任务使用该模式；普通 codex 保持精简。
+agent_kind="$agent"
+case "$agent" in
+  codex)  agent_args=(--profile cli --sandbox danger-full-access --ask-for-approval never --disable apps) ;;
+  codex-app)
+          agent_kind=codex
+          agent_args=(--sandbox danger-full-access --ask-for-approval never --enable apps) ;;
+  grok)   agent_args=(--always-approve) ;;
+  claude) agent_args=(--dangerously-skip-permissions --model "${model:-claude-opus-4-8}" --effort "${effort:-max}") ;;
+  *) err "执行者只支持 codex|codex-app|grok|claude，收到：$agent"; exit 1 ;;
+esac
+# Claude 交互窗格通过原生参数追加身份说明。Codex 交互窗格在首条消息中追加同等说明。
+if [[ "$kind_prefix" == 交互 && "$agent" == claude ]]; then
+  agent_args+=(--append-system-prompt "身份：交互窗格。该窗格用于用户直接参与的功能讨论和原型评审。请直接回答用户提出的问题；不得分配任务或执行验收；不得写入长期记忆。讨论结论由主 Agent 审查后写入项目记录。")
+fi
+# 顾问窗格：项目经理身份（见 ~/.claude/CLAUDE.md 角色表）。
+if [[ "$kind_prefix" == 顾问 && "$agent" == claude ]]; then
+  agent_args+=(--append-system-prompt "身份：项目经理顾问窗格（本工作区常驻）。职责：审阅 spec、拆分任务、架构判断、根因判断、风险评估、回答主 Agent 与执行者的技术疑问。纪律：不主动推进、不分配任务、不改代码、不执行验收、不读写长期记忆文件；以证据为准，执行者拿证据可以推翻你的判断。回答直接给结论与理由，篇幅克制，最后一行单独写「【回答完毕】」。")
+fi
+
+# 恢复模式：各家 CLI 的 resume 参数（codex 是子命令 resume）
+if [[ -n "$resume_id" ]]; then
+  case "$agent" in
+    claude) agent_args+=(--resume "$resume_id") ;;
+    grok)   agent_args+=(--resume "$resume_id") ;;
+    codex|codex-app) agent_args+=(resume "$resume_id") ;;
+  esac
+fi
+
+# 名字必须唯一，重名会让按名寻址失效（0.7.5 起 start 也会校验，这里提前报错给出中文提示）
+if herdr agent get "$name" 2>/dev/null | jq -e '.result.agent' >/dev/null 2>&1; then
+  err "Agent 名称「$name」已存在。请更换名称，或先关闭原窗格。"; exit 1
+fi
+
+# 任务书追加内容（幂等，靠标记行判断）。交互窗格没有交付报告义务，跳过。
+guard="任务必须由你独立完成，不得转交其他 Agent"
+if [[ "$kind_prefix" != 交互 && "$kind_prefix" != 顾问 ]] && [[ -n "$taskfile" ]] && ! grep -qF "$guard" "$taskfile"; then
   cat >> "$taskfile" <<EOF
 
 ---
-## 交付要求（herdr-dispatch 自动附加）
-- 交活前自查：产出物路径在回复里写明；关键步骤贴出真实执行证据（命令+输出摘要）；不留后台残留进程。
-- 做不下去就明确说卡在哪，不要硬编。
+## 交付要求（herdr-dispatch 自动追加）
+- 交付前检查：在回复中写明产出物路径；提供关键步骤的真实执行证据，包括命令和输出摘要；不得保留未说明的后台进程。
+- 无法继续执行时，明确说明阻塞原因，不得编造结果。
 - ${guard}。
 EOF
+  # grok 独有：开发任务用 implement 技能（内含 code-review 自检）
+  if [[ "$agent" == grok ]]; then
+    cat >> "$taskfile" <<'EOF'
+- 开发任务请使用 `/implement` 技能。该技能会在任务完成后调用 `/code-review` 进行自检。
+EOF
+  fi
 fi
 
-# 定位落点
+# 定位目标标签页或目标窗格
 if [[ -n "$branch" ]]; then
   [[ -n "$repo" && -d "$repo/.git" ]] || { err "隔离模式需要 -r 指向 git 仓库根目录"; exit 1; }
   repo="${repo:A}"
   base="${base:-origin/main}"
-  # 基线新鲜度：能 fetch 就 fetch，离线时明说、用本地引用继续
-  git -C "$repo" fetch origin main >/dev/null 2>&1 || err "警告: fetch origin main 失败，基线用本地现有引用"
+  # 尝试更新远程分支；失败时输出警告并继续使用本地引用。
+  git -C "$repo" fetch origin main >/dev/null 2>&1 || err "警告：无法更新 origin/main，将继续使用现有本地引用。"
   git -C "$repo" rev-parse --verify --quiet "$base" >/dev/null \
-    || { err "基线不存在: $base"; exit 1; }
-  # 分支必须全新——复用旧分支等于继承未知基点，宁可报错也不静默
+    || { err "基线不存在：$base"; exit 1; }
+  # 为避免继承未知基线，检测到已有分支时直接报错。
   git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" \
-    && { err "分支已存在: $branch（先删掉或换名，防止误用旧基线）"; exit 1; }
-  wtroot="$HOME/projects/worktrees/${repo:t}"
-  mkdir -p "$wtroot"
-  cwd="$wtroot/${branch//\//-}"
-  [[ -e "$cwd" ]] && { err "工作树目录已存在: $cwd（先清理）"; exit 1; }
-  wt_out=$(git -C "$repo" worktree add "$cwd" -b "$branch" "$base" 2>&1) \
-    || { err "git worktree add 失败: $wt_out"; exit 1; }
-  print -- "worktree 就绪: $cwd (分支 $branch ← 基线 $base @ $(git -C "$repo" rev-parse --short "$base"))"
+    && { err "分支已存在：$branch（请删除该分支或更换名称，以免使用错误基线。）"; exit 1; }
+  # 原生 herdr worktree（2026-08-11 恢复使用原生命令）：0.8.0 起支持 --base，2026-07-11 弃用它的
+  # 「基点跟随当前检出」该问题已修复；「每个任务独立 workspace」保留为新模型——隔离任务落在自己的
+  # worktree workspace（侧栏按分支可见），不进分区判定；验收后
+  # `herdr worktree remove --workspace <id> --force` 同时删除工作树和工作区。
+  wt_out=$(herdr worktree create --cwd "$repo" --branch "$branch" --base "$base" \
+      --label "${label:-$branch}" --no-focus 2>&1) \
+    || { err "herdr worktree create 失败：$wt_out"; exit 1; }
+  pane=$(print -- "$wt_out" | jq -r '.result.root_pane.pane_id // empty')
+  cwd=$(print -- "$wt_out" | jq -r '.result.root_pane.cwd // empty')
+  wt_ws=$(print -- "$wt_out" | jq -r '.result.workspace.workspace_id // empty')
+  [[ -n "$pane" && -n "$cwd" && -n "$wt_ws" ]] \
+    || { err "worktree create 的返回结果缺少必要字段：$wt_out"; exit 1; }
+  ws="$wt_ws"
+  print -- "worktree 就绪：$cwd（分支 $branch ← 基线 $base @ $(git -C "$repo" rev-parse --short "$base")；独立 workspace $wt_ws，验收后运行 herdr worktree remove --workspace $wt_ws --force 删除该工作树和工作区）"
 fi
 cwd="${cwd:-$PWD}"
 ws="${ws:-${HERDR_WORKSPACE_ID:-}}"
-tab="${tab:-${HERDR_TAB_ID:-}}"
+# 注意：tab 不再默认取 HERDR_TAB_ID——避免所有工作窗格默认创建在主 Agent 所在标签页中。
+# 留空即走下面的分区判定；只有显式 -t 才锁定标签页。
 [[ -n "$ws" ]] || { err "需要 -w workspace_id（或在 herdr 内运行）"; exit 1; }
-[[ -d "$cwd" ]] || { err "工作目录不存在: $cwd"; exit 1; }
+[[ -d "$cwd" ]] || { err "工作目录不存在：$cwd"; exit 1; }
 
-# 起 agent
-start_args=(--workspace "$ws" --split right --no-focus --cwd "$cwd")
-[[ -n "$tab" ]] && start_args+=(--tab "$tab")
-out=$(herdr agent start "$name" "${start_args[@]}" -- "${argv[@]}" 2>&1) \
-  || { err "agent start 失败: $out"; exit 1; }
-
-# 等 TUI 就绪（集成 hook 会上报 idle）
-if ! herdr agent wait "$name" --status idle --timeout 90000 >/dev/null 2>&1; then
-  err "90 秒内未就绪，先看画面: herdr agent read $name"; exit 2
+# 创建窗格（0.7.5：agent start 不再改动布局，必须先有目标窗格）
+#
+# 落点规则（2026-08-06）：除非 -t 显式指定，工作窗格一律落在按 -k/-g 归类的
+# 工作标签页里，不再挤主 Agent 所在标签页。同名区满 maxpanes 格就开下一个（「… 2」「… 3」）。
+grid_mode=0
+# 隔离模式已自带目标窗格（worktree workspace 的 root pane），不进分区判定
+if [[ -z "$tab" && -z "${pane:-}" ]]; then
+  grid_mode=1
+  place=$(herdr tab list --workspace "$ws" 2>/dev/null | python3 -c '
+import json, re, sys
+base, cap = sys.argv[1], int(sys.argv[2])
+alias = sys.argv[3] if len(sys.argv) > 3 else ""
+tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+seen, cand = set(), []
+labels = [base] + ([alias] if alias and alias != base else [])
+for t in tabs:
+    lab = t.get("label") or ""
+    n = None
+    for prefix in labels:
+        if lab == prefix:
+            n = 1
+            break
+        m = re.match(r"^" + re.escape(prefix) + r" (\d+)$", lab)
+        if m:
+            n = int(m.group(1))
+            break
+    if n is None:
+        continue
+    seen.add(n)
+    cand.append((n, t.get("tab_id"), t.get("pane_count") or 0))
+for n, tid, pc in sorted(cand):
+    if pc < cap:
+        print("reuse", tid)
+        break
+else:
+    n = 1
+    while n in seen:
+        n += 1
+    print("create", base if n == 1 else "%s %d" % (base, n))
+' "$tab_label" "$maxpanes" "$legacy_tab_label" 2>/dev/null)
+  [[ -n "$place" ]] || { err "无法确定目标标签页：无法读取 tab list。"; exit 1; }
+  tab="${place#* }"   # reuse 时是 tab_id，create 时是新标签页标签
+  if [[ "$place" == create\ * ]]; then
+    new_label="$tab"   # 满格溢出时带「 2」「 3」后缀，与 tab_label 不一定相同
+    tc_out=$(herdr tab create --workspace "$ws" --cwd "$cwd" --label "$new_label" --no-focus 2>&1) \
+      || { err "tab create 失败：$tc_out"; exit 1; }
+    pane=$(print -- "$tc_out" | jq -r '.result.root_pane.pane_id // empty')
+    tab=$(print -- "$tc_out" | jq -r '.result.tab.tab_id // empty')
+    [[ -n "$pane" && -n "$tab" ]] || { err "无法从 tab create 的返回结果中获取标签页 ID 或窗格 ID：$tc_out"; exit 1; }
+    print -- "已创建工作标签页：$new_label ($tab)"
+  fi
 fi
 
-pane=$(herdr agent get "$name" | jq -r '.result.agent.pane_id // empty')
-[[ -n "$pane" ]] || { err "拿不到 pane_id"; exit 2; }
+# 落在既有标签页（复用工作标签页，或 -t 显式指定）时才需要切分
+if [[ -z "${pane:-}" ]]; then
+  base_pane=$(herdr pane list --workspace "$ws" 2>/dev/null \
+    | jq -r --arg t "$tab" '[.result.panes[] | select(.tab_id == $t)] | last | .pane_id // empty')
+  [[ -n "$base_pane" ]] || { err "标签页 $tab 中没有可用于分割的窗格。"; exit 1; }
+  split_out=$(herdr pane split "$base_pane" --direction right --cwd "$cwd" --no-focus 2>&1) \
+    || { err "pane split 失败：$split_out"; exit 1; }
+  pane=$(print -- "$split_out" | jq -r '.result.pane.pane_id // .result.pane_id // empty' 2>/dev/null)
+  [[ -n "$pane" ]] || { err "无法从 pane split 的返回结果中获取新窗格 ID：$split_out"; exit 1; }
+fi
 
-# 归位窗格布局（主格左 40% + agent 右侧网格），两种模式一致；失败不影响派单
+# 启动 Agent（0.7.5：start 内置就绪等待，成功即代表 TUI 可接收输入）。
+# 刚 split 出的窗格 Shell 尚未就绪时报 agent_pane_busy，等一秒重试，最多 10 次。
+out=""
+for try in {1..10}; do
+  out=$(herdr agent start "$name" --kind "$agent_kind" --pane "$pane" --timeout 90000 -- "${agent_args[@]}" 2>&1) && break
+  if print -- "$out" | grep -q 'agent_pane_busy'; then sleep 1; continue; fi
+  err "agent start 失败：$out"; herdr pane close "$pane" >/dev/null 2>&1; exit 2
+done
+print -- "$out" | grep -q 'agent_pane_busy' \
+  && { err "窗格 Shell 在 10 秒内未就绪：$out"; herdr pane close "$pane" >/dev/null 2>&1; exit 2; }
+
+# 中文标签写到窗格标签 + 侧栏显示名（显示用；寻址一律用 -n 的 Agent 名称）
+if [[ -n "$label" ]]; then
+  herdr pane rename "$pane" "$label" >/dev/null 2>&1
+  herdr pane report-metadata "$pane" --source herdr-dispatch --agent "$agent" --display-agent "$label" >/dev/null 2>&1
+fi
+# 顾问窗格：按工作区登记角色，供 herdr-guwen 定位（名字不算数，标签与登记文件算数）
+if [[ "$kind_prefix" == 顾问 ]]; then
+  adv_dir="$HOME/.claude/state/herdr-advisor"
+  mkdir -p "$adv_dir" && print -- "$pane" > "$adv_dir/$ws" \
+    && print -- "顾问已登记：工作区 $ws → 窗格 $pane（$adv_dir/$ws）" \
+    || err "警告：顾问角色登记失败（$adv_dir/$ws）"
+fi
+
+# 调整布局；失败不影响任务分配。
+# 工作标签页中没有主对话窗格，全是同级 Agent，走均分网格；-t 指定的标签页（通常是主 Agent
+# 所在标签页）仍按「主对话窗格左 40% + Agent 右侧网格」排。
 ltab=$(herdr pane get "$pane" 2>/dev/null | jq -r '.result.pane.tab_id // empty')
-[[ -n "$ltab" ]] && "${0:A:h}/herdr-layout" --tab "$ltab" >/dev/null 2>&1
+if [[ -n "$ltab" ]]; then
+  if (( grid_mode )); then
+    ~/.claude/bin/herdr-layout --tab "$ltab" --grid >/dev/null 2>&1
+  else
+    ~/.claude/bin/herdr-layout --tab "$ltab" >/dev/null 2>&1
+  fi
+fi
 
-# 原子派单（文本+回车一次提交，不会卡输入框）。
-# 刚上报 idle 时 TUI 可能尚未接管输入（启动竞态、信任确认页），发送后核验，最多重试 2 次。
-st="未确认 working，请人工查看: herdr agent read $name"
-for attempt in 1 2 3; do
+# 交互窗格：agent start 成功后写入 opened 或 resumed 日志，再轮询获取会话 ID；获取失败不影响后续流程。
+if [[ "$kind_prefix" == 交互 ]]; then
+  log_bin="${0:A:h}/herdr-log"
+  if [[ -x "$log_bin" ]]; then
+    if [[ -n "$resume_id" ]]; then
+      ev=$(python3 -c '
+import json,sys
+from datetime import datetime,timezone,timedelta
+# 本机时区
+tz=datetime.now().astimezone().tzinfo
+ts=datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S%z")
+ts=ts[:-2]+":"+ts[-2:] if len(ts)>=5 and ts[-5] in "+-" else ts
+print(json.dumps({
+  "ts":ts,"event":"resumed","name":sys.argv[1],"pane":sys.argv[2],
+  "session_id":sys.argv[3],"label":sys.argv[4],"area":sys.argv[5],
+  "agent":sys.argv[6],"model":sys.argv[7],"effort":sys.argv[8],"cwd":sys.argv[9],
+}, ensure_ascii=False, separators=(",",":")))
+' "$name" "$pane" "$resume_id" "$label" "$area" "$agent" "${model:-}" "${effort:-}" "$cwd")
+    else
+      ev=$(python3 -c '
+import json,sys
+from datetime import datetime
+tz=datetime.now().astimezone().tzinfo
+ts=datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S%z")
+ts=ts[:-2]+":"+ts[-2:] if len(ts)>=5 and ts[-5] in "+-" else ts
+print(json.dumps({
+  "ts":ts,"event":"opened","name":sys.argv[1],"label":sys.argv[2],
+  "area":sys.argv[3],"agent":sys.argv[4],"model":sys.argv[5],
+  "effort":sys.argv[6],"cwd":sys.argv[7],"pane":sys.argv[8],
+}, ensure_ascii=False, separators=(",",":")))
+' "$name" "$label" "$area" "$agent" "${model:-}" "${effort:-}" "$cwd" "$pane")
+    fi
+    "$log_bin" append "$ev" >/dev/null 2>&1 || err "警告：herdr-log append 失败（交互日志未写入）"
+    # 轮询 agent_session（间隔 2s、最多 30s）；取不到不报错，由 herdr-log 后续补充写入
+    for _i in {1..15}; do
+      sess_json=$(herdr agent get "$name" 2>/dev/null)
+      sid=$(print -- "$sess_json" | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null)
+      if [[ -n "$sid" ]]; then
+        trpath=$(print -- "$sess_json" | jq -r '.result.agent.agent_session.transcript // .result.agent.transcript // empty' 2>/dev/null)
+        sev=$(python3 -c '
+import json,sys
+from datetime import datetime
+tz=datetime.now().astimezone().tzinfo
+ts=datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S%z")
+ts=ts[:-2]+":"+ts[-2:] if len(ts)>=5 and ts[-5] in "+-" else ts
+d={"ts":ts,"event":"session","name":sys.argv[1],"session_id":sys.argv[2]}
+if sys.argv[3]:
+  d["transcript"]=sys.argv[3]
+print(json.dumps(d, ensure_ascii=False, separators=(",",":")))
+' "$name" "$sid" "$trpath")
+        "$log_bin" append "$sev" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 2
+    done
+  else
+    err "警告：找不到 herdr-log（$log_bin），交互日志未写入"
+  fi
+fi
+
+# 一次性提交任务（0.7.5 agent prompt：尊重 bracketed-paste 后补回车，一次提交；
+# --wait 后 5 秒内无状态变化返回 agent_prompt_stalled，用于替代旧版「空回车+轮询」的补偿逻辑）
+# 恢复模式且无 -f/-q：不需要首条消息，跳过 prompt。
+if [[ -z "$taskfile" && -z "$q" ]]; then
+  if [[ "$kind_prefix" == 顾问 ]]; then
+    print -- "顾问窗格已就绪：$name → $agent（${model}）@ $pane"
+    print -- "提问：herdr-guwen \"<问题>\"（自动定位本工作区顾问、等待并读回回答）"
+    exit 0
+  fi
+  st="会话已恢复，未发送首条消息。"
+  print -- "任务已分配：$name → $agent @ $pane"
+  print -- "状态：$st"
+  print -- "状态通知：恢复模式不会自动登记。需要监控时，请手动运行 herdr agent wait $name"
+  exit 0
+fi
+
+st="未确认 Agent 已进入 working 状态，请人工检查：herdr agent read $name"
+for attempt in 1 2 3 4 5; do   # 2026-08-19：由 3 次增至 5 次，给 Codex 启动期提示框留足消退时间
   (( attempt > 1 )) && sleep 5
-  herdr pane run "$pane" "读取并执行：$taskfile" >/dev/null 2>&1 \
-    || { err "pane run 发送失败（第 $attempt 次）"; continue; }
-  if herdr agent wait "$name" --status working --timeout 20000 >/dev/null 2>&1; then
-    st="working ✓（第 $attempt 次发送）"
+  send_text="${q:-${start:-读取并执行：}$taskfile}"
+  if [[ "$kind_prefix" == 交互 && ( "$agent" == codex || "$agent" == codex-app ) ]]; then
+    send_text="身份：交互窗格。该窗格用于老板直接参与的功能讨论和原型评审。直接回答老板的问题；不分配任务、不执行验收、不写入长期记忆。讨论结论由主控复核后记录。\n\n$send_text"
+  fi
+  p_out=$(herdr agent prompt "$name" "$send_text" --wait --until working --until blocked --timeout 30000 2>&1)
+  p_rc=$?
+  p_state=$(print -- "$p_out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+  if (( p_rc == 0 )) && [[ "$p_state" == "working" ]]; then
+    st="working（第 $attempt 次发送）"
     break
   fi
-  # 没进 working 的三种情况：
-  # blocked = 停在确认页/提问页，要人工；画面有任务书路径 = 送达但没动，要人工；
-  # 都不是 = 文本被启动期吞掉（TUI 初始化清空输入框），重发。
-  # 注意送达检查不能用 wait output——它只等新出现的文本，秒送达反而误判未送达。
-  if [[ "$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status // empty')" == "blocked" ]]; then
-    st="停在确认页/提问页（blocked），请人工查看: herdr agent read $name"
+  if [[ "$p_state" == "blocked" ]] \
+     || [[ "$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status // empty')" == "blocked" ]]; then
+    # 2026-08-19 实测：Codex 刚启动时的更新提示框 / 额度警告会被 herdr 判成 blocked，而任务文本其实没送进去。
+    # 先核对文本是否已出现在窗格：送达了才是真 blocked；没送达按未生效处理，等几秒重试。
+    if herdr pane wait-output "$pane" --match "${q:-$taskfile}" --timeout 3000 >/dev/null 2>&1; then
+      st="停留在确认页面或提问页面（blocked），请人工查看：herdr agent read $name"
+      break
+    fi
+    err "状态 blocked 但任务文本未送达（多半是启动期提示框，第 $attempt 次），重试"
+    continue
+  fi
+  if print -- "$p_out" | grep -q 'agent_prompt_stalled'; then
+    err "提交未生效（agent_prompt_stalled，第 $attempt 次），重试"
+    continue
+  fi
+  # 其他失败（超时/未知错误）：若终端输出已显示任务书路径，则视为文字已经发送，并转为人工检查；否则重试。
+  # 用 pane wait-output 而不是 agent read | grep：wait-output 读的是 recent_unwrapped
+  # 快照（软换行已拼接），而任务书是长绝对路径，在窄窗格里必然折行——按渲染文本 grep
+  # 会被折行切断而漏判「其实已送达」。官方手册确认 wait-output 会立即匹配已有输出，
+  # 不是只等新文本（2026-08-04 实测：已存在的串 13ms 返回）。
+  if herdr pane wait-output "$pane" --match "${q:-$taskfile}" --timeout 3000 >/dev/null 2>&1; then
+    st="文本已发送但未进入 working，请人工查看：herdr agent read $name"
     break
   fi
-  if herdr agent read "$name" 2>/dev/null | grep -qF "$taskfile"; then
-    st="文本已送达但未进入 working，请人工查看: herdr agent read $name"
-    break
-  fi
-  err "文本被启动期吞掉（第 $attempt 次），重发"
+  err "未确认任务已经开始（第 $attempt 次）：${p_out:0:200}"
 done
 
-print -- "派单完成: $name → $agent @ $pane"
-print -- "状态: $st"
-print -- "监听: herdr agent wait $name --status idle --timeout <毫秒>"
-[[ "$st" == "working ✓"* ]] && exit 0 || exit 2
+# 系统 toast 仍交给 herdr 原生（2026-07-17：不自发 herdr notification show）。
+# 主控状态通知由 herdr-dispatch-watch 登记：开发或审查窗格停止活动后发送至已登记的主控会话。
+
+watch_note="监听：未登记（交互窗格、顾问窗格或 HERDR_DISPATCH_NO_WATCH=1）"
+if [[ "$st" == "working（第"* && "$kind_prefix" != 交互 && "$kind_prefix" != 顾问 && -z "${HERDR_DISPATCH_NO_WATCH:-}" ]]; then
+  watch_bin="${0:A:h}/herdr-dispatch-watch"
+  if [[ -x "$watch_bin" ]]; then
+    # 谁派单谁收：把本窗格登记为收件地址（不在 herdr 内运行时为空，watch 退回全局兜底）
+    w_args=(register --name "$name" --pane "$pane" --kind "$kind_prefix" --label "$label" --cwd "$cwd" --agent "$agent" --notify-target "${HERDR_PANE_ID:-}")
+    if [[ "$agent" == codex || "$agent" == codex-app ]]; then
+      watch_sid=$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null)
+      [[ -n "$watch_sid" ]] && w_args+=(--session-id "$watch_sid")
+    fi
+    [[ -n "$taskfile" ]] && w_args+=(--taskfile "$taskfile")
+    w_out=$("$watch_bin" "${w_args[@]}" 2>&1) \
+      && watch_note="监听：请立即后台运行 ~/.claude/bin/herdr-dispatch-watch wait $name （阻塞到完工或 blocked 后退出，退出即信号；不会往对话推送通知）" \
+      || err "警告：任务状态通知登记失败：$w_out"
+  else
+    err "警告：找不到 herdr-dispatch-watch（$watch_bin）"
+    watch_note="监听：herdr agent wait $name --timeout <毫秒>（herdr-dispatch-watch 缺失，请手动后台运行）"
+  fi
+fi
+
+print -- "任务已分配：$name → $agent @ $pane"
+print -- "状态：$st"
+print -- "$watch_note"
+print -- "验收前检查：运行 herdr-busy $name。退出码 0 表示未检测到受监控的活动命令，可进行人工验收；退出码 1 表示仍有受监控命令正在运行。"
+[[ "$st" == "working（第"* ]] && exit 0 || exit 2

@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+# herdr-busy — 识别状态显示为 idle、但仍存在受监控子进程的 Agent 窗格
+#
+# 为什么需要它：
+#   herdr 的 agent_status 根据终端输出活动推断。Agent 启动耗时命令（测试、构建、
+#   git fetch）或阻塞在 herdr wait 里时，屏幕不动，herdr 报 idle。
+#   因此仍需人工读取 Agent 输出，才能确认任务结果。
+#   herdr-idle 若只看 idle，可能关闭仍在执行测试的窗格。
+#   本脚本检查窗格 Shell 的完整进程树，按规则识别这些命令，给出判定。
+#
+# 用法：
+#   herdr-busy                    # 列出状态为 idle/done、但仍存在受监控命令的窗格
+#   herdr-busy --json             # 同上，机器可读输出：{"pane_id": {...}}
+#   herdr-busy <agent名|pane_id>  # 单窗格判定；退出码 0=未检测到受监控的活动命令，可进入人工验收；1=仍在执行
+#   herdr-busy --tag              # 扫描并把标签写进窗格 tokens（侧栏可见），已停止的清除
+#   herdr-busy --tag-pane <id>    # 只处理一个窗格（给 herdr 事件钩子用）
+#   herdr-busy --all              # 同时检查状态为 working 的窗格（默认只查 idle/done）
+#
+# 判定边界：
+# - 只认规则表里的命令。dev server（run-dev.sh 等）、MCP server、编辑器一律不
+#   计为受监控任务进程——它们常驻，标出来只会产生无意义的提示。宁可漏报也不误报。
+# - 排除窗格自己的 agent TUI 进程（前台进程组），只看它启动的子进程。
+
+import json, os, re, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+# 常驻进程排除表：先于规则表判定，命中即不计为受监控任务进程。
+# MCP server、language server、dev server 长期存在，标出来只是噪音；而且它们的
+# 命令行里常带工具名（playwright-mcp、typescript-language-server），不排除就会
+# 被下面的规则表误判成正在执行测试。
+IGNORE = [
+    r"[-_]mcp\b|\bmcp[-_]server\b|--mcp\b",
+    r"language[-_]server|\btsserver\b|\blsp[-_]",
+    r"run-dev\.sh|\b(next|vite|nuxt|astro)\s+dev\b|\bwatch\b",
+    r"\bnvim\b|\bvim\b|\bhx\b|\bcode\b\s",
+]
+IGNORE = [re.compile(p) for p in IGNORE]
+
+# 规则表：(正则, 标签)，命中即止。正则匹配整条命令行。
+# 词尾一律用 (\s|$) 而不是 \b——\b 会让 `playwright-mcp` 命中 `playwright`。
+# 标签会写进侧栏，herdr 限 32 字符，短为宜。
+RULES = [
+    (r"(^|/)herdr\s+(agent\s+)?wait(\s|$)",                      "等待其他窗格"),
+    (r"(^|/)(vitest|jest|pytest|phpunit)(\s|$)",                 "正在执行测试"),
+    (r"(^|/)playwright\s+test(\s|$)",                            "正在执行测试"),
+    (r"(^|/)cargo\s+(test|build|clippy)(\s|$)",                  "正在执行 Cargo 命令"),
+    (r"(^|/)go\s+(test|build)(\s|$)",                            "正在执行 Go 命令"),
+    (r"(^|/)(npm|pnpm|yarn|bun|npx)\s+(run\s+)?"
+     r"(test|build|lint|typecheck|tsc|check)(\s|$)",             "正在执行测试或构建"),
+    (r"(^|/)tsc(\s|$)",                                          "类型检查"),
+    (r"(^|/)git\s+(clone|fetch|pull|push|rebase|bisect)(\s|$)",  "正在执行 Git 远程操作"),
+    (r"(^|/)(xcodebuild|make|cmake|gradle)(\s|$)",               "正在执行构建"),
+    (r"(^|/)swift\s+build(\s|$)",                                "正在执行构建"),
+    (r"(^|/)ffmpeg(\s|$)",                                       "正在执行转码"),
+    (r"(^|/)(claude|grok|codex|opencode)(\s|$)",                 "已启动子 Agent"),
+]
+RULES = [(re.compile(p), lab) for p, lab in RULES]
+
+SOURCE = "herdr-busy"   # 标签归属，只清自己写的
+TOKEN = "busy"
+TTL_MS = 900_000        # 钩子万一不再触发，标签 15 分钟后自动过期，不会永久持续保留
+REST = ("idle", "done") # 默认只查这些状态
+
+
+# herdr 事件钩子用最小 PATH 调本脚本，可执行文件一律绝对路径解析。
+HERDR = (os.environ.get("HERDR_BIN_PATH")
+         or next((p for p in (os.path.expanduser("~/.local/bin/herdr"),
+                              "/opt/homebrew/bin/herdr", "/usr/local/bin/herdr")
+                  if os.path.exists(p)), "herdr"))
+PS = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+
+
+def herdr(*args, timeout=5):
+    try:
+        r = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=timeout)
+        d = json.loads(r.stdout.strip() or r.stderr.strip())
+    except Exception:
+        return {}
+    return d.get("result", {}) if not d.get("error") else {}
+
+
+def process_table():
+    """系统进程表：pid -> (ppid, 命令行)。通过一次 ps 调用读取全部进程，避免每个窗格重复调用。"""
+    try:
+        r = subprocess.run([PS, "-eo", "pid=,ppid=,command="],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return {}
+    table = {}
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            table[int(parts[0])] = (int(parts[1]), parts[2])
+        except ValueError:
+            continue
+    return table
+
+
+def descendants(table, root):
+    """shell_pid 的全部后代 pid。后台运行的命令也包含在内，所以不能只看前台进程组。"""
+    kids = {}
+    for pid, (ppid, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    out, stack = [], list(kids.get(root, []))
+    while stack:
+        pid = stack.pop()
+        out.append(pid)
+        stack.extend(kids.get(pid, []))
+    return out
+
+
+def classify(pane_id, table):
+    """返回 (标签, 命中的命令行) 或 None。"""
+    pi = herdr("pane", "process-info", "--pane", pane_id).get("process_info", {})
+    shell_pid = pi.get("shell_pid")
+    if not shell_pid:
+        return None
+    # 前台进程组就是 agent 自己的 TUI，跳过；要找的是它启动的子进程
+    skip = {p.get("pid") for p in pi.get("foreground_processes", []) if p.get("pid")}
+    for pid in descendants(table, shell_pid):
+        if pid in skip:
+            continue
+        cmd = table.get(pid, (0, ""))[1]
+        if any(rx.search(cmd) for rx in IGNORE):
+            continue
+        for rx, label in RULES:
+            if rx.search(cmd):
+                return label, cmd
+    return None
+
+
+def scan(only_pane=None, include_working=False):
+    """返回 {pane_id: {name, label, cmd, status, ws}}，只含判定为存在受监控命令的窗格。"""
+    agents = herdr("agent", "list").get("agents", [])
+    ws_label = {w.get("workspace_id"): (w.get("label") or w.get("workspace_id"))
+                for w in herdr("workspace", "list").get("workspaces", [])}
+    targets = []
+    for a in agents:
+        pid = a.get("pane_id")
+        if only_pane and pid != only_pane:
+            continue
+        if not include_working and a.get("agent_status") not in REST:
+            continue
+        targets.append(a)
+    if not targets:
+        return {}
+
+    table = process_table()
+    hits = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = pool.map(lambda a: (a, classify(a["pane_id"], table)), targets)
+        for a, res in results:
+            if not res:
+                continue
+            label, cmd = res
+            hits[a["pane_id"]] = {
+                "name": a.get("name") or a.get("display_agent") or "(主对话窗格)",
+                "label": label,
+                "cmd": cmd[:120],
+                "status": a.get("agent_status"),
+                "ws": ws_label.get(a.get("workspace_id"), a.get("workspace_id")),
+            }
+    return hits
+
+
+def tag(hits, panes_checked):
+    """把标签写进窗格 tokens；未检测到受监控命令时，清除自己之前写的标签。
+    先读一遍现状，只在标签需要变化时才写——状态检查脚本会频繁调用，
+    对十几个窗格无条件发清除请求没有必要。"""
+    current = {p.get("pane_id"): (p.get("tokens") or {}).get(TOKEN)
+               for p in herdr("pane", "list").get("panes", [])}
+    for pid in panes_checked:
+        want = hits[pid]["label"] if pid in hits else None
+        have = current.get(pid)
+        if want == have:
+            continue
+        if want:
+            herdr("pane", "report-metadata", pid, "--source", SOURCE,
+                  "--token", f"{TOKEN}={want}", "--ttl-ms", str(TTL_MS))
+        else:
+            herdr("pane", "report-metadata", pid, "--source", SOURCE,
+                  "--clear-token", TOKEN)
+
+
+def resolve(target):
+    """Agent 名或 pane_id → pane_id。"""
+    for a in herdr("agent", "list").get("agents", []):
+        if target in (a.get("name"), a.get("pane_id")):
+            return a["pane_id"]
+    return None
+
+
+def main():
+    argv = sys.argv[1:]
+    as_json = "--json" in argv
+    do_tag = "--tag" in argv
+    include_working = "--all" in argv
+
+    # 事件钩子模式：herdr 把事件写入 HERDR_PLUGIN_EVENT_JSON 环境变量，只处理事件里那个窗格
+    if "--from-event" in argv:
+        try:
+            data = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON", "{}")).get("data", {})
+            pane = data.get("pane_id")
+        except Exception:
+            pane = None
+        if not pane:
+            print("事件里没有 pane_id", file=sys.stderr)
+            return 0
+        # 标签只在「herdr 说停了但其实没停」时才有意义。窗格转回 working 时
+        # herdr 自己的状态已经准确，scan 查不到它，tag() 顺势把旧标签清掉。
+        hits = scan(only_pane=pane)
+        tag(hits, [pane])
+        # 钩子静默运行；将诊断信息写入插件日志，便于排查问题。
+        print(f"pane={pane} status={data.get('agent_status')} "
+              f"判定={hits.get(pane, {}).get('label') or '未检测到受监控的活动命令'}", file=sys.stderr)
+        return 0
+
+    # 单窗格写标签（手动或脚本调用）
+    if "--tag-pane" in argv:
+        pane = argv[argv.index("--tag-pane") + 1]
+        hits = scan(only_pane=pane, include_working=True)
+        tag(hits, [pane])
+        return 0
+
+    # 单窗格判定模式：退出码即答案
+    positional = [a for a in argv if not a.startswith("--")]
+    if positional:
+        pane = resolve(positional[0])
+        if not pane:
+            print(f"找不到 Agent 或窗格：{positional[0]}", file=sys.stderr)
+            return 2
+        hits = scan(only_pane=pane, include_working=True)
+        if pane in hits:
+            h = hits[pane]
+            print(f"仍在执行：{h['label']}：{h['cmd']}")
+            return 1
+        print("未检测到受监控的活动命令，可以进行人工验收。")
+        return 0
+
+    hits = scan(include_working=include_working)
+
+    if do_tag:
+        # 清理范围是全部 Agent 窗格，不只是 idle/done 的：一个窗格被标之后转回
+        # working，也得把标签摘掉，否则要等 TTL 过期才消失。
+        tag(hits, [a["pane_id"] for a in herdr("agent", "list").get("agents", [])])
+
+    if as_json:
+        print(json.dumps(hits, ensure_ascii=False))
+        return 0
+
+    if not hits:
+        print("未发现包含受监控活动命令的空闲窗格。")
+        return 0
+    for pid, h in hits.items():
+        print(f"{pid}  {h['name']}  {h['label']}  @ {h['ws']}")
+        print(f"    {h['cmd']}")
+    print(f"\n共 {len(hits)} 个窗格显示为空闲状态，但仍存在受监控的活动命令；暂不验收或关闭。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

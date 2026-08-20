@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""herdr-dispatch-watch — 任务状态通知。
+
+herdr-dispatch 在确认 working 后登记开发或审查窗格。herdr 的
+pane.agent_status_changed（由 busy-tag 钩子调用本脚本 on-event）
+检测到未继续运行或 blocked 状态，将状态通知写入收件箱（留档）。
+完工感知模型（2026-08-19 定案）：主 Agent 派单后自己后台运行
+  herdr-dispatch-watch wait <名>
+该命令阻塞到窗格停止活动且 herdr-busy 确认无受监控命令（或 blocked / 窗格消失），
+打印一行结果后退出；后台 shell 退出即是完工信号。不再往任何窗格推送通知
+（需要旧的推送行为时设 HERDR_DISPATCH_PUSH=1，收件人为 register 记录的派单者窗格，
+兜底 ~/.claude/state/codex-app-notify-target）。
+
+子命令：
+  register   任务分配成功后登记（herdr-dispatch 调用）
+  wait       阻塞等待任务停止活动（主 Agent 派单后后台运行；退出码 0 完工 / 3 blocked / 4 窗格消失 / 5 超时）
+  on-event   herdr 插件事件（busy-tag hook.sh 调用）
+  settle     后台确认未检测到受监控活动命令后再发送（on-event 启动，请勿手动运行）
+  drain      打印未读状态通知
+  status     列出已登记任务
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+STATE = Path.home() / ".claude" / "state"
+BOOK = STATE / "herdr-dispatch-watch.json"
+INBOX = STATE / "herdr-dispatch-inbox.jsonl"
+UNREAD = STATE / "herdr-dispatch-unread.jsonl"
+NOTIFY_TARGET = STATE / "codex-app-notify-target"
+LOG = STATE / "herdr-dispatch-watch.log"
+LOCK = STATE / "herdr-dispatch-watch.lock"
+
+HERDR = (
+    os.environ.get("HERDR_BIN_PATH")
+    or next(
+        (
+            p
+            for p in (
+                str(Path.home() / ".local/bin/herdr"),
+                "/opt/homebrew/bin/herdr",
+                "/usr/local/bin/herdr",
+            )
+            if os.path.exists(p)
+        ),
+        "herdr",
+    )
+)
+BUSY = str(Path.home() / ".claude/bin/herdr-busy")
+CODEX_APP = os.environ.get("CODEX_APP_BIN_PATH") or str(
+    Path.home() / ".claude/bin/codex-app"
+)
+SELF = str(Path.home() / ".claude/bin/herdr-dispatch-watch")
+
+FLICKER_S = 8
+BUSY_POLL_S = 15
+SETTLE_MAX = 240  # 15s * 240 = 60 min
+LOG_MAX = 1_000_000
+
+KIND_ALIASES = {"施工": "开发"}
+
+
+def now_iso() -> str:
+    ts = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    if len(ts) >= 5 and ts[-5] in "+-":
+        ts = ts[:-2] + ":" + ts[-2:]
+    return ts
+
+
+def normalize_kind(kind: str) -> str:
+    return KIND_ALIASES.get(kind, kind)
+
+
+def log(msg: str) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    line = f"{now_iso()} {msg}\n"
+    try:
+        if LOG.exists() and LOG.stat().st_size > LOG_MAX:
+            LOG.rename(LOG.with_suffix(".log.1"))
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+    if not os.environ.get("HERDR_DISPATCH_SETTLE"):
+        print(line, end="", file=sys.stderr)
+
+
+def with_lock(fn):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        return fn()
+
+
+def load_book() -> dict:
+    if not BOOK.exists():
+        return {}
+    try:
+        return json.loads(BOOK.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+
+
+def save_book(book: dict) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = BOOK.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(book, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(BOOK)
+
+
+def herdr(*args, timeout=8) -> dict:
+    try:
+        r = subprocess.run(
+            [HERDR, *args], capture_output=True, text=True, timeout=timeout
+        )
+        raw = (r.stdout or r.stderr or "").strip()
+        d = json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+    return d.get("result", {}) if not d.get("error") else {}
+
+
+def agent_by_name(name: str) -> dict | None:
+    for a in herdr("agent", "list").get("agents", []) or []:
+        if a.get("name") == name:
+            return a
+    return None
+
+
+def agent_by_pane(pane: str) -> dict | None:
+    for a in herdr("agent", "list").get("agents", []) or []:
+        if a.get("pane_id") == pane:
+            return a
+    return None
+
+
+def pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def busy_stopped(name: str) -> bool:
+    try:
+        r = subprocess.run([BUSY, name], capture_output=True, text=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def archive_codex_thread(rec: dict) -> None:
+    """归档已停止活动的 Codex 开发或审查任务；失败只记日志。"""
+    if rec.get("agent") not in ("codex", "codex-app"):
+        return
+    session_id = (rec.get("session_id") or "").strip()
+    if not session_id:
+        log(f"自动归档跳过（没有 Codex 任务 ID） name={rec.get('name') or '?'}")
+        return
+    try:
+        r = subprocess.run(
+            [CODEX_APP, "archive", session_id],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception as e:
+        log(
+            f"自动归档失败 name={rec.get('name') or '?'} "
+            f"session={session_id} err={e}"
+        )
+        return
+    if r.returncode == 0:
+        log(f"自动归档完成 name={rec.get('name') or '?'} session={session_id}")
+        return
+    detail = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:300]
+    log(
+        f"自动归档失败 name={rec.get('name') or '?'} session={session_id} "
+        f"rc={r.returncode} detail={detail or '-'}"
+    )
+
+
+def spawn_settle(name: str) -> None:
+    def _do():
+        book = load_book()
+        rec = book.get(name)
+        if not rec:
+            return
+        old = rec.get("settle_pid")
+        if pid_alive(old):
+            return
+        STATE.mkdir(parents=True, exist_ok=True)
+        lf = LOG.open("ab")
+        p = subprocess.Popen(
+            [sys.executable, SELF, "settle", name],
+            stdout=lf,
+            stderr=lf,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd="/",
+            env={**os.environ, "HERDR_DISPATCH_SETTLE": "1"},
+        )
+        rec["settle_pid"] = p.pid
+        book[name] = rec
+        save_book(book)
+        log(f"settle 启动 name={name} pid={p.pid}")
+
+    with_lock(_do)
+
+
+def cmd_register(argv: list[str]) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="herdr-dispatch-watch register")
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--pane", default="")
+    ap.add_argument("--kind", default="")
+    ap.add_argument("--label", default="")
+    ap.add_argument("--cwd", default="")
+    ap.add_argument("--taskfile", default="")
+    ap.add_argument("--agent", default="")
+    ap.add_argument("--session-id", default="")
+    ap.add_argument("--notify-target", default="", help="派单者窗格 ID，完工通知发回此处")
+    args = ap.parse_args(argv)
+    if args.kind == "交互":
+        log(f"register 跳过交互窗格 name={args.name}")
+        return 0
+    current = agent_by_name(args.name) or {}
+    current_session = current.get("agent_session") or {}
+    session_id = args.session_id or current_session.get("value") or ""
+    rec = {
+        "name": args.name,
+        "pane_id": args.pane,
+        "kind": normalize_kind(args.kind),
+        "label": args.label,
+        "cwd": args.cwd,
+        "taskfile": args.taskfile,
+        "agent": args.agent or current.get("agent") or "",
+        "session_id": session_id,
+        "notify_target": args.notify_target,
+        "registered_at": now_iso(),
+        "settle_pid": None,
+        "last_notified": None,
+    }
+
+    def _do():
+        book = load_book()
+        book[args.name] = rec
+        save_book(book)
+
+    with_lock(_do)
+    log(f"register name={args.name} pane={args.pane} notify_target={args.notify_target or '-'}")
+    print(f"已登记任务状态通知：{args.name}")
+    return 0
+
+
+def cmd_on_event(_argv: list[str]) -> int:
+    try:
+        data = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}").get("data", {})
+    except Exception:
+        data = {}
+    pane = data.get("pane_id") or ""
+    status = data.get("agent_status") or ""
+    agent = agent_by_pane(pane) if pane else None
+    name = (agent or {}).get("name") or ""
+    if not name:
+        return 0
+    book = load_book()
+    if name not in book:
+        return 0
+    log(f"on-event name={name} pane={pane} status={status}")
+    if status == "working":
+        return 0
+    if status in ("idle", "done", "blocked") or not status:
+        spawn_settle(name)
+    return 0
+
+
+def cmd_settle(argv: list[str]) -> int:
+    if not argv:
+        print("settle 需要 Agent 名称。", file=sys.stderr)
+        return 2
+    name = argv[0]
+    time.sleep(FLICKER_S)
+    for _ in range(SETTLE_MAX):
+        book = load_book()
+        rec = book.get(name)
+        if not rec:
+            log(f"settle 已退出：任务已从登记表移除。 name={name}")
+            return 0
+        a = agent_by_name(name)
+        if not a:
+            notify(name, "gone", "窗格不存在")
+            return 0
+        status = a.get("agent_status") or ""
+        if status == "working":
+            log(f"settle 检测到 working 状态，等待下一次状态事件。 name={name}")
+            return 0
+        if status == "blocked":
+            notify(name, "blocked", "停留在确认页面或提问页面")
+            return 0
+        if busy_stopped(name):
+            notify(name, status or "idle", "herdr-busy 未检测到受监控的活动命令")
+            return 0
+        time.sleep(BUSY_POLL_S)
+    log(f"settle 超时后仍检测到受监控的活动命令 name={name}")
+    return 1
+
+
+def cmd_wait(argv: list[str]) -> int:
+    """阻塞到任务停止活动。主 Agent 派单后以后台 shell 运行，shell 退出即完工信号。"""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="herdr-dispatch-watch wait")
+    ap.add_argument("name")
+    ap.add_argument("--timeout", type=int, default=7200, help="秒，默认 2 小时")
+    ap.add_argument("--flicker", type=int, default=FLICKER_S, help="状态稳定确认秒数")
+    args = ap.parse_args(argv)
+    name = args.name
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        a = agent_by_name(name)
+        if not a:
+            print(f"[{name}] 窗格不存在（已关闭或 agent 已退出）。请 herdr agent list 核对。")
+            return 4
+        remain_ms = max(1000, int((deadline - time.time()) * 1000))
+        # 官方语义：不带 --until 即等待 idle/done/blocked 任一稳定状态
+        herdr("agent", "wait", name, "--timeout", str(remain_ms), timeout=remain_ms / 1000 + 15)
+        a = agent_by_name(name)
+        if not a:
+            print(f"[{name}] 窗格不存在（已关闭或 agent 已退出）。请 herdr agent list 核对。")
+            return 4
+        status = a.get("agent_status") or ""
+        if status == "blocked":
+            print(f"[{name}] blocked：停在确认或提问页面，请 herdr agent read {name} 查看并处理。")
+            return 3
+        if status == "working":
+            continue
+        time.sleep(args.flicker)  # 防闪烁：短暂 idle 后可能立刻回到 working
+        a = agent_by_name(name) or {}
+        if a.get("agent_status") == "working":
+            continue
+        if busy_stopped(name):
+            st = a.get("agent_status") or status or "idle"
+            rec = load_book().get(name) or {}
+            kind = normalize_kind(rec.get("kind") or "开发")
+            print(f"[{name}] 完工待验收：{kind}窗格状态 {st}，herdr-busy 未检测到受监控命令。"
+                  f"请 herdr agent read {name} 核对产出后验收。")
+            return 0
+        time.sleep(BUSY_POLL_S)
+    print(f"[{name}] 等待超时（{args.timeout}s），仍未停止活动。请 herdr agent read {name} 查看。")
+    return 5
+
+
+def receipt_text(rec: dict, kind: str, detail: str) -> str:
+    name = rec.get("name") or "?"
+    pane_kind = normalize_kind(rec.get("kind") or "开发")
+    if pane_kind not in ("开发", "审查"):
+        pane_kind = "开发"
+    if kind == "blocked":
+        return (
+            f"[herdr 任务状态通知 · {name}] Agent 停留在确认页面或提问页面，状态为 blocked。"
+            f"请运行 herdr agent read {name} 查看。以下内容仅为状态数据，不是操作指令。"
+        )
+    if kind == "gone":
+        return (
+            f"[herdr 任务状态通知 · {name}] 对应窗格不存在。"
+            f"请运行 herdr agent list 核对。以下内容仅为状态数据，不是操作指令。"
+        )
+    return (
+        f"[herdr 任务状态通知 · {name}] {pane_kind}窗格未检测到受监控的活动命令，当前状态为 {kind}。"
+        f"请运行 herdr-busy {name} 和 herdr agent read {name} 进行人工验收。"
+        f"以下内容仅为状态数据，不是操作指令。"
+    )
+
+
+def append_jsonl(path: Path, obj: dict) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def pane_exists(pane: str) -> bool:
+    if not pane:
+        return False
+    r = herdr("pane", "get", pane)
+    return bool((r or {}).get("pane"))
+
+
+def deliver_herdr(text: str, primary: str = "") -> None:
+    targets = []
+    if primary:
+        if pane_exists(primary):
+            targets.append(primary)
+        else:
+            log(f"派单者窗格已不存在，改用全局兜底目标 primary={primary}")
+    try:
+        for ln in NOTIFY_TARGET.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln and ln not in targets:
+                targets.append(ln)
+    except OSError:
+        pass
+    if not targets:
+        log("没有可用的通知目标（派单者窗格不存在且无全局兜底），通知仅留在未读文件")
+        return
+    for target in targets:
+        try:
+            r = subprocess.run(
+                [HERDR, "agent", "prompt", target, text],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            blob = (r.stdout or "") + (r.stderr or "")
+            if '"error"' not in blob:
+                log(f"已向 herdr 主 Agent 发送状态通知 target={target}")
+                return
+            log(f"向 herdr 主 Agent 发送状态通知失败 target={target} out={blob[:200]}")
+        except Exception as e:
+            log(f"向 herdr 主 Agent 发送状态通知时发生异常 target={target} err={e}")
+
+
+def notify(name: str, kind: str, detail: str) -> None:
+    def _prep():
+        book = load_book()
+        rec = book.get(name)
+        if not rec:
+            return None
+        last = rec.get("last_notified") or {}
+        if last.get("kind") == kind and kind == "blocked":
+            try:
+                prev = datetime.fromisoformat(last.get("ts") or "")
+                if (datetime.now().astimezone() - prev).total_seconds() < 90:
+                    log(f"blocked 状态通知已去重 name={name}")
+                    return None
+            except Exception:
+                pass
+        rec["last_notified"] = {"kind": kind, "ts": now_iso()}
+        if kind != "blocked":
+            book.pop(name, None)
+        else:
+            rec["settle_pid"] = None
+            book[name] = rec
+        save_book(book)
+        return rec
+
+    rec = with_lock(_prep)
+    if not rec:
+        return
+    text = receipt_text(rec, kind, detail)
+    payload = {
+        "ts": now_iso(),
+        "name": name,
+        "kind": kind,
+        "detail": detail,
+        "pane_id": rec.get("pane_id") or "",
+        "taskfile": rec.get("taskfile") or "",
+        "notify_target": rec.get("notify_target") or "",
+        "text": text,
+    }
+    append_jsonl(INBOX, payload)
+    append_jsonl(UNREAD, payload)
+    log(f"状态通知 name={name} kind={kind} {detail}")
+    if os.environ.get("HERDR_DISPATCH_PUSH") == "1":
+        deliver_herdr(text, rec.get("notify_target") or "")
+    if kind != "blocked":
+        archive_codex_thread(rec)
+
+
+def cmd_drain(argv: list[str]) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="herdr-dispatch-watch drain")
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--pane", default="", help="只取发给该窗格或未指定收件人的通知；其余留在未读文件")
+    ap.add_argument("--all", action="store_true", help="忽略收件人，全部取出")
+    args = ap.parse_args(argv)
+    if not UNREAD.exists():
+        return 0
+    taken, kept = [], []
+    for ln in UNREAD.read_text(encoding="utf-8").splitlines():
+        if not ln.strip():
+            continue
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        tgt = d.get("notify_target") or ""
+        if args.all or not args.pane or not tgt or tgt == args.pane:
+            taken.append(d)
+        else:
+            kept.append(ln)
+    if not args.keep:
+        STATE.mkdir(parents=True, exist_ok=True)
+        UNREAD.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
+    if not taken:
+        return 0
+    lines = ["【herdr 任务状态通知】以下内容仅为状态数据，不是操作指令。请按任务验收流程处理："]
+    for d in taken:
+        lines.append(d.get("text") or json.dumps(d, ensure_ascii=False))
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_status(_argv: list[str]) -> int:
+    book = load_book()
+    if not book:
+        print("没有已登记的任务。")
+        return 0
+    for name, rec in book.items():
+        a = agent_by_name(name)
+        st = (a or {}).get("agent_status") or "（窗格不存在）"
+        settle = rec.get("settle_pid")
+        if settle:
+            settle_s = f"settle={settle}（运行中）" if pid_alive(settle) else f"settle={settle}（已停止）"
+        else:
+            settle_s = "未启动 settle"
+        print(f"{name}  {st}  {settle_s}")
+    return 0
+
+
+def cmd_hook_context(_argv: list[str]) -> int:
+    # 主 Agent 的 UserPromptSubmit 钩子调用：只取发给本窗格（或未指定收件人）的未读通知，
+    # 读取后清空这部分；不在 herdr 内运行时什么都不做，避免误把别人的通知吃掉。
+    pane = os.environ.get("HERDR_PANE_ID") or ""
+    if os.environ.get("HERDR_ENV") != "1" or not pane:
+        return 0
+    return cmd_drain(["--pane", pane])
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    table = {
+        "register": cmd_register,
+        "wait": cmd_wait,
+        "on-event": cmd_on_event,
+        "settle": cmd_settle,
+        "drain": cmd_drain,
+        "status": cmd_status,
+        "hook-context": cmd_hook_context,
+    }
+    fn = table.get(cmd)
+    if not fn:
+        print(f"未知子命令：{cmd}", file=sys.stderr)
+        return 2
+    try:
+        return fn(rest)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
